@@ -1,0 +1,792 @@
+---
+output:
+  knitrBootstrap::bootstrap_document:
+    title: "L. major Acceptor Site Smoothing and Primary UTR detection"
+    theme: flatly
+---
+
+```{r knitr_settings, include=FALSE}
+library(knitr)
+opts_chunk$set(fig.width=1920/96,
+               fig.height=1080/96,
+               dpi=96)
+```
+
+L. major Acceptor Site Smoothing and Primary UTR detection
+==========================================================
+
+Overview
+--------
+
+The goal of this analysis is to parse the output from our [UTR analysis
+pipeline](https://github.com/khughitt/utr_analysis) and to perform some basic
+smoothing of the spliced leader and polya acceptor site counts, and determine
+the most likely primary UTR boundaries for each gene where information is
+available.
+
+```{r run_date, results='asis', echo=FALSE}
+email = "<a href='mailto:khughitt@umd.edu'>Keith Hughitt</a>"
+last_update = format(Sys.time(), "(<time>%Y-%m-%d</time>)")
+cat(paste(email, last_update))
+
+# Clean up any existing variables
+rm(list=ls())
+```
+
+Settings
+--------
+
+```{r settings}
+max_plots = 10
+```
+
+[view source](README.rmd)
+
+Methods
+-------
+
+### Load data
+
+```{r load_annotations, warning=FALSE}
+library(GenomicRanges)
+library(Biostrings)
+library(rtracklayer)
+library(ggplot2)
+library(ggvis)
+library(reshape2)
+
+# Genome sequence and annotations from TriTrypDB (8.0)
+gff = import.gff(file.path('/cbcb/lab/nelsayed/ref_data/lmajor_friedlin',
+                           '/annotation/TriTrypDB-8.0_LmajorFriedlin.gff'),
+                 version='3')
+chromosomes = gff[gff$type == 'chromosome']
+genes       = gff[gff$type == 'gene']
+
+input_fasta = file.path(Sys.getenv("REF"), 
+                        "lmajor_friedlin/genome/TriTrypDB-8.0_LmajorFriedlin_Genome.fasta")
+fasta = readDNAStringSet(input_fasta)
+
+# Fix names (L. major chromosome identifiers)
+names(fasta) = substring(names(fasta), 0, 7)
+
+# Number of bases flanking CDS to scan for motifs when actual UTR length is not
+# known; numbers are based on median 5' and 3' UTR lengths for L. major
+default_5utr_width = 250
+default_3utr_width = 575
+
+# Taken from L. major UTR analysis output from 2014/11/14
+procyclic_polya  = import.gff(gzfile('input/lmajor_procyclic_ncrnas_removed_polya.gff.gz'), version='3')
+metacyclic_polya = import.gff(gzfile('input/lmajor_metacyclic_ncrnas_removed_polya.gff.gz'), version='3')
+procyclic_sl  = import.gff(gzfile('input/lmajor_procyclic_ncrnas_removed_sl.gff.gz'), version='3')
+metacyclic_sl = import.gff(gzfile('input/lmajor_metacyclic_ncrnas_removed_sl.gff.gz'), version='3')
+
+# Create output and build directories if needed
+for (x in c('build', 'output')) {
+    if (!file.exists(x)) {
+        dir.create(x)
+    }
+}
+```
+
+```{r helper_functions}
+#
+# find_peak
+#
+find_peak = function(gene, acceptor_sites, gene_strand, feature_type,
+                     smoothed=FALSE, include_plot=FALSE) {
+    # Determine orientation of feature relative to CDS
+    if ((feature_type == 'sl'    && gene_strand == '+') ||
+        (feature_type == 'polya' && gene_strand == '-')) {
+        feature_side = 'left'
+    } else {
+        feature_side = 'right'
+    }
+
+    # Create a vector from the furthest SL site to the CDS boundary
+    if (feature_side == 'left') {
+        cds_boundary = start(gene)
+        raw_scores = rep(0, cds_boundary - min(start(acceptor_sites)))
+        rel_start =  cds_boundary - start(acceptor_sites) + 1
+    } else {
+        cds_boundary = end(gene)
+        raw_scores = rep(0, max(start(acceptor_sites)) - cds_boundary)
+        rel_start = start(acceptor_sites) - cds_boundary + 1
+    }
+
+    # add scores at indices where acceptor sites were detected
+    raw_scores[rel_start] = score(acceptor_sites)
+    x = 1:length(raw_scores)
+
+    # create smooted version of scores (optional)
+    if (smoothed) {
+        input_scores = ksmooth(x, raw_scores, kernel="normal", bandwidth=6,
+                               n.points=length(x))$y
+    } else {
+        input_scores = raw_scores
+    }
+
+    # find acceptor site peak
+    j = 1
+    sorted_scores = sort(input_scores, decreasing=TRUE)
+    max_score_idx = which(input_scores == sorted_scores[j])
+
+    if (length(max_score_idx) > 1) {
+        if (feature_side == 'left') {
+            max_score_idx = head(max_score_idx, 1)
+        } else {
+            max_score_idx = tail(max_score_idx, 1)
+        }
+    }
+    max_raw = raw_scores[max_score_idx]
+
+    # If smoothing was used, the actual location of the smoothed peak may not
+    # have any support. In this case we will find the nearest site to the peak
+    # with a non-zero score in the raw scores vector
+    while(max_raw == 0) {
+        # find next highest peak
+        j = j + 1 
+        max_score_idx = which(input_scores == sorted_scores[j])
+
+        # if more than one peak, choose the furthest one from CDS
+        if (length(max_score_idx) > 1) {
+            if (feature_side == 'left') {
+                max_score_idx = head(max_score_idx, 1)
+            } else {
+                max_score_idx = tail(max_score_idx, 1)
+            }
+        }
+        max_raw = raw_scores[max_score_idx]
+    }
+
+    # plot raw and smoothed peaks
+    if (include_plot) {
+        if (smoothed) {
+            df = melt(data.frame(x, raw=raw_scores, smoothed=input_scores),
+                      id=c("x"), variable.name='type')
+            print(qplot(x, value, data=df, color=type, geom='line') 
+                  + ggtitle(gene$ID))
+        } else {
+            df = melt(data.frame(x, raw=raw_scores), id=c("x"),
+                    variable.name='type')
+            print(qplot(x, value, data=df, geom='line')
+                  + ggtitle(gene$ID))
+        }
+    }
+
+    # find index of the site with the highest score
+    max_index = which(score(acceptor_sites) == max_raw)
+
+    # if there is a tie, use the furthest site from CDS
+    if (length(max_index) > 1) {
+        if (feature_side == 'left') {
+            max_index = head(max_index, 1)
+        } else {
+            max_index = tail(max_index, 1)
+        }
+    }
+    return(max_index)
+}
+
+#
+# find_primary_site
+#
+# Determines the primary site among a list of acceptor sites and their
+# associated score (number of reads mapped).
+#
+find_primary_site = function(acceptor_sites, feature, gene, gene_strand, smoothed=FALSE) {
+    if (length(acceptor_sites) == 0) {
+        return(c(NA, NA))
+    } else if (length(acceptor_sites) == 1) {
+        # if only one site found, use it
+        return(c(start(acceptor_sites)[1], score(acceptor_sites)[1]))
+    } else {
+        # two or more sites
+
+        # find highest smoothed peak which has non-zero coverage in the raw
+        # data as well
+        max_index = find_peak(gene, acceptor_sites, gene_strand, feature,
+                              smoothed=smoothed)
+        max_index_smoothed = find_peak(gene, acceptor_sites, gene_strand,
+                                       feature, smoothed=TRUE)
+
+        # if the smoothing would result in a different primary UTR choice,
+        # plot the raw and smoothed versions of the data
+        if (abs(max_index - max_index_smoothed) > 15) {
+            num_diff = num_diff + 1
+            if (plot_num <= max_plots) {
+                tmp = find_peak(gene, acceptor_sites, gene_strand, feature,
+                                smoothed=TRUE, include_plot=TRUE)
+                plot_num = plot_num + 1
+            }
+        }
+
+        return(c(start(acceptor_sites)[max_index], 
+                 score(acceptor_sites)[max_index]))
+    }
+}
+
+#
+# get_utr_sequences
+#
+# Returns a vector of Biostrings instances containing the UTR sequence for each
+# input gene.
+#
+get_utr_sequences = function(genes, fasta, utr_lengths, default_width,
+                             utr5=TRUE) {
+    # retrieve utr length if known
+    widths = data.frame(
+        id=genes$ID,
+        width=NA)
+
+    widths$width = utr_lengths[match(genes$ID, utr_lengths$name),]$length
+    widths$width[is.na(widths$width)] = default_width
+
+    # get positive and negative strand genes
+    if (utr5) { 
+        utr = flank(genes, widths$width)
+    } else {
+        utr = flank(genes, widths$width, start=FALSE)
+    }
+    pos_strand = utr[as.character(strand(utr)) == "+"]
+    neg_strand = utr[as.character(strand(utr)) == "-"]
+
+    seqs = fasta[pos_strand]
+    seqs = append(seqs, reverseComplement(fasta[neg_strand]))
+    names(seqs) = c(pos_strand$ID, neg_strand$ID)
+
+    return(seqs)
+}
+```
+
+### Compute UTR coordinates and features
+
+#### 5'UTR
+
+##### 5'UTR Length
+
+```{r compute_5utr_lengths, message=FALSE, cache=TRUE, autodep=TRUE}
+# Output columns
+procyclic_lengths   = c()
+procyclic_num_reads = c()
+
+metacyclic_lengths   = c()
+metacyclic_num_reads = c()
+
+combined_lengths   = c()
+combined_num_reads = c()
+
+# Start GFF output for combined set of acceptor sites
+gff_lines = c("##gff-version\t3",
+             "##feature-ontology\tsofa.obo",
+             "##attribute-ontology\tgff3_attributes.obo")
+
+# Add chromosome entries
+for (i in 1:length(chromosomes)) {
+    ch = chromosomes[i]
+    gff_lines = append(gff_lines, paste("##sequence-region", ch$Name, 1,
+                                        ch$size, sep='\t'))
+}
+
+# GFF chromosome entries
+#for (i in 1:length(chromosomes)) {
+#    ch = chromosomes[i]
+#    # ID=LmjF.01;Name=LmjF.01;description=LmjF.01;size=268988;web_id=LmjF.01;
+#    # molecule_type=dsDNA;organism_name=Leishmania
+#    #  major;translation_table=1;topology=linear;localization=nuclear;
+#    # Dbxref=ApiDB:LmjF.01,taxon:347515
+
+#    descr_template = paste0(
+#        "ID=%s;Name=%s;description=%s;size=%s;web_id=%s;",
+#        "molecule_type=%s;organism_name=%s;translation_table=%s",
+#        "topology=%s;localization=%s;Dbxref=%s")
+        
+#    descr = sprintf(descr_template,
+#                    ch$ID, ch$Name, ch$description, ch$size, ch$web_id,
+#                    ch$molecule_type, ch$organism_name, ch$translation_table,
+#                    ch$topology, ch$localization, 
+    
+#                    paste(ch$Dbxref[[1]][1], ch$Dbxref[[1]][2], sep=','))
+#    gff_lines = append(gff_lines, paste(ch$Name, "TriTrypDB", "chromosome", 1,
+#                                        ch$size, ".", "+", ".", descr,
+#                                        sep='\t'))
+#}
+
+# keep track of the number of plots created
+num_diff = 0
+plot_num = 0
+
+# Add gene entries
+i = 1
+for (name in genes$Name) {
+    message(sprintf("Processing SL sites for gene %d/%d", i, length(genes)))
+    gene = genes[genes$Name == name]
+
+    gene_strand = as.character(strand(gene)) 
+    # get all of the SL acceptor sites as a GRanges object
+    metacyclic_utr5 = metacyclic_sl[metacyclic_sl$Name == name]
+    procyclic_utr5  = procyclic_sl[procyclic_sl$Name == name]
+    combined_utr5   = metacyclic_sl[metacyclic_sl$Name == name]
+
+    # total number of reads found which contain an acceptor site
+    metacyclic_num_reads = append(metacyclic_num_reads, 
+                                  sum(metacyclic_utr5$score))
+    procyclic_num_reads  = append(procyclic_num_reads,
+                                  sum(procyclic_utr5$score))
+    combined_num_reads   = append(combined_num_reads,
+                                  sum(procyclic_utr5$score) +
+                                  sum(metacyclic_utr5$score))
+    
+    # Combined output
+    if (length(procyclic_utr5) > 0) {
+        for (j in 1:length(procyclic_utr5)) {
+            # if new site, add a new entry
+            entry = procyclic_utr5[j]
+            if(!start(entry) %in% start(combined_utr5)) {
+                combined_utr5 = c(combined_utr5, entry)
+            }
+            # otherwise add procyclic score to existing metacyclic score
+            else {
+                site = combined_utr5[start(combined_utr5) == start(entry)]
+                score(site) = score(site) + score(entry)
+            }
+        }
+    }
+    i = i + 1
+
+    # Determine length and scores for procyclic, metacyclic, and combined
+    # outputs
+    pro_site      = find_primary_site(procyclic_utr5, 'sl', gene, gene_strand)
+    meta_site     = find_primary_site(metacyclic_utr5, 'sl', gene, gene_strand)
+    combined_site = find_primary_site(combined_utr5, 'sl', gene, gene_strand)
+
+    # compute 5'utr length and coordinates
+    if (gene_strand == '+') {
+        # procylic + strand
+        procyclic_utr5_length = start(gene) - pro_site[1]
+
+        # metacyclic + strand
+        metacyclic_utr5_length = start(gene) - meta_site[1]
+
+        # combined + strand
+        combined_utr5_start  = combined_site[1] + 1
+        combined_utr5_end    = start(gene) - 1
+        combined_utr5_length = start(gene) - combined_site[1]
+    } else {
+        # procyclic - strand
+        procyclic_utr5_length = pro_site[1] - end(gene)
+
+        # metacyclic - strand
+        metacyclic_utr5_length = meta_site[1] - end(gene)
+        
+        # combined - strand
+        combined_utr5_start  = end(gene) + 1
+        combined_utr5_end    = combined_site[1] - 1
+        combined_utr5_length = combined_site[1] - end(gene)
+    }
+
+    procyclic_lengths  = append(procyclic_lengths,  procyclic_utr5_length)
+    metacyclic_lengths = append(metacyclic_lengths, metacyclic_utr5_length)
+    combined_lengths   = append(combined_lengths,   combined_utr5_length)
+
+    descr = sprintf("ID=%s_5utr;Name=%s;description=%s", gene$ID, gene$Name,
+                    gene$description)
+
+    gff_entry = paste(
+        seqnames(gene),
+        "El-Sayed",
+        "five_prime_UTR",
+        combined_utr5_start,
+        combined_utr5_end,
+        combined_site[2],
+        strand(gene),
+        '.',
+        descr, sep='\t')
+
+    gff_lines = append(gff_lines, gff_entry)
+}
+
+# metacyclic
+metacyclic_utr5_df = data.frame(
+    name=genes$Name,
+    length=metacyclic_lengths,
+    num_reads=metacyclic_num_reads
+)
+
+# procyclic
+procyclic_utr5_df = data.frame(
+    name=genes$Name,
+    length=procyclic_lengths,
+    num_reads=procyclic_num_reads
+)
+
+# combined
+combined_utr5_df = data.frame(
+    name=genes$Name,
+    length=combined_lengths,
+    num_reads=combined_num_reads
+)
+```
+
+##### 5'UTR Composition
+
+```{r utr5_composition}
+# Metacyclic
+metacyclic_utr5_sequences = get_utr_sequences(genes, fasta, metacyclic_utr5_df, 
+                                              default_5utr_width, utr5=TRUE)
+freqs = alphabetFrequency(metacyclic_utr5_sequences)[,1:4] 
+metacyclic_utr5_features_df = data.frame(
+    name=names(metacyclic_utr5_sequences),
+    gc=(freqs[,'G'] + freqs[,'C']) / rowSums(freqs),
+    ct=(freqs[,'C'] + freqs[,'T']) / rowSums(freqs)
+)
+metacyclic_utr5_df = merge(metacyclic_utr5_df, metacyclic_utr5_features_df,
+                           by='name')
+
+# Procyclic
+procyclic_utr5_sequences = get_utr_sequences(genes, fasta, procyclic_utr5_df, 
+                                              default_5utr_width, utr5=TRUE)
+freqs = alphabetFrequency(procyclic_utr5_sequences)[,1:4] 
+procyclic_utr5_features_df = data.frame(
+    name=names(procyclic_utr5_sequences),
+    gc=(freqs[,'G'] + freqs[,'C']) / rowSums(freqs),
+    ct=(freqs[,'C'] + freqs[,'T']) / rowSums(freqs)
+)
+procyclic_utr5_df = merge(procyclic_utr5_df, procyclic_utr5_features_df,
+                          by='name')
+
+# Combined
+combined_utr5_sequences = get_utr_sequences(genes, fasta, combined_utr5_df, 
+                                              default_5utr_width, utr5=TRUE)
+freqs = alphabetFrequency(combined_utr5_sequences)[,1:4] 
+combined_utr5_features_df = data.frame(
+    name=names(combined_utr5_sequences),
+    gc=(freqs[,'G'] + freqs[,'C']) / rowSums(freqs),
+    ct=(freqs[,'C'] + freqs[,'T']) / rowSums(freqs)
+)
+combined_utr5_df = merge(combined_utr5_df, combined_utr5_features_df,
+                         by='name')
+```
+
+```{r utr5_output}
+# Write results
+write.csv(metacyclic_utr5_df, file='output/lmajor_metacyclic_5utr_lengths.csv',
+          quote=FALSE, row.names=FALSE)
+write.csv(procyclic_utr5_df, file='output/lmajor_procyclic_5utr_lengths.csv',
+          quote=FALSE, row.names=FALSE)
+write.csv(combined_utr5_df, file='output/lmajor_combined_5utr_lengths.csv',
+          quote=FALSE, row.names=FALSE)
+
+# Write result to GFF
+fp = file("output/lmajor_5utr.gff")
+writeLines(gff_lines, fp)
+close(fp)
+```
+
+#### 5'UTR
+
+```{r compute_3utr_lengths, message=FALSE, cache=TRUE, autodep=TRUE}
+# Output columns
+procyclic_lengths   = c()
+procyclic_num_reads = c()
+
+metacyclic_lengths   = c()
+metacyclic_num_reads = c()
+
+combined_lengths   = c()
+combined_num_reads = c()
+
+# Start GFF output for combined set of acceptor sites
+gff_lines = c("##gff-version\t3",
+             "##feature-ontology\tsofa.obo",
+             "##attribute-ontology\tgff3_attributes.obo")
+
+# Add chromosome entries
+for (i in 1:length(chromosomes)) {
+    ch = chromosomes[i]
+    gff_lines = append(gff_lines, paste("##sequence-region", ch$Name, 1,
+                                        ch$size, sep='\t'))
+}
+
+# GFF chromosome entries
+#for (i in 1:length(chromosomes)) {
+#    ch = chromosomes[i]
+#    # ID=LmjF.01;Name=LmjF.01;description=LmjF.01;size=268988;web_id=LmjF.01;
+#    # molecule_type=dsDNA;organism_name=Leishmania
+#    #  major;translation_table=1;topology=linear;localization=nuclear;
+#    # Dbxref=ApiDB:LmjF.01,taxon:347515
+
+#    descr_template = paste0(
+#        "ID=%s;Name=%s;description=%s;size=%s;web_id=%s;",
+#        "molecule_type=%s;organism_name=%s;translation_table=%s",
+#        "topology=%s;localization=%s;Dbxref=%s")
+        
+#    descr = sprintf(descr_template,
+#                    ch$ID, ch$Name, ch$description, ch$size, ch$web_id,
+#                    ch$molecule_type, ch$organism_name, ch$translation_table,
+#                    ch$topology, ch$localization, 
+    
+#                    paste(ch$Dbxref[[1]][1], ch$Dbxref[[1]][2], sep=','))
+#    gff_lines = append(gff_lines, paste(ch$Name, "TriTrypDB", "chromosome", 1,
+#                                        ch$size, ".", "+", ".", descr,
+#                                        sep='\t'))
+#}
+
+# keep track of the number of plots created
+num_diff = 0
+plot_num = 0
+
+# Add gene entries
+i = 1
+for (name in genes$Name) {
+    message(sprintf("Processing Poly(A) sites for gene %d/%d", i, length(genes)))
+    gene = genes[genes$Name == name]
+
+    gene_strand = as.character(strand(gene)) 
+    # get all of the Poly(A) acceptor sites as a GRanges object
+    metacyclic_utr3 = metacyclic_polya[metacyclic_polya$Name == name]
+    procyclic_utr3  = procyclic_polya[procyclic_polya$Name == name]
+    combined_utr3   = metacyclic_polya[metacyclic_polya$Name == name]
+
+    # total number of reads found which contain an acceptor site
+    metacyclic_num_reads = append(metacyclic_num_reads, 
+                                  sum(metacyclic_utr3$score))
+    procyclic_num_reads  = append(procyclic_num_reads,
+                                  sum(procyclic_utr3$score))
+    combined_num_reads   = append(combined_num_reads,
+                                  sum(procyclic_utr3$score) +
+                                  sum(metacyclic_utr3$score))
+    
+    # Combined output
+    if (length(procyclic_utr3) > 0) {
+        for (j in 1:length(procyclic_utr3)) {
+            # if new site, add a new entry
+            entry = procyclic_utr3[j]
+            if(!start(entry) %in% start(combined_utr3)) {
+                combined_utr3 = c(combined_utr3, entry)
+            }
+            # otherwise add procyclic score to existing metacyclic score
+            else {
+                site = combined_utr3[start(combined_utr3) == start(entry)]
+                score(site) = score(site) + score(entry)
+            }
+        }
+    }
+    i = i + 1
+
+    # Determine length and scores for procyclic, metacyclic, and combined
+    # outputs
+    pro_site      = find_primary_site(procyclic_utr3, 'polya', gene, gene_strand)
+    meta_site     = find_primary_site(metacyclic_utr3, 'polya', gene, gene_strand)
+    combined_site = find_primary_site(combined_utr3, 'polya', gene, gene_strand)
+
+    # compute 3'utr length and coordinates
+    if (gene_strand == '+') {
+        # procylic + strand
+        procyclic_utr3_length = pro_site[1] - end(gene)
+
+        # metacyclic + strand
+        metacyclic_utr3_length = meta_site[1] - end(gene)
+
+        # combined + strand
+        combined_utr3_start  = end(gene) + 1
+        combined_utr3_end    = combined_site[1] - 1
+        combined_utr3_length = combined_site[1] - end(gene)
+    } else {
+        # procyclic - strand
+        procyclic_utr3_length = start(gene) - pro_site[1]
+
+        # metacyclic - strand
+        metacyclic_utr3_length = start(gene) - meta_site[1]
+        
+        # combined - strand
+        combined_utr3_start  = combined_site[1] + 1
+        combined_utr3_end    = start(gene) - 1
+        combined_utr3_length = start(gene) - combined_site[1]
+    }
+
+    procyclic_lengths  = append(procyclic_lengths,  procyclic_utr3_length)
+    metacyclic_lengths = append(metacyclic_lengths, metacyclic_utr3_length)
+    combined_lengths   = append(combined_lengths,   combined_utr3_length)
+
+    descr = sprintf("ID=%s_3utr;Name=%s;description=%s", gene$ID, gene$Name,
+                    gene$description)
+
+    gff_entry = paste(
+        seqnames(gene),
+        "El-Sayed",
+        "five_prime_UTR",
+        combined_utr3_start,
+        combined_utr3_end,
+        combined_site[2],
+        strand(gene),
+        '.',
+        descr, sep='\t')
+
+    gff_lines = append(gff_lines, gff_entry)
+}
+
+# metacyclic
+metacyclic_utr3_df = data.frame(
+    name=genes$Name,
+    length=metacyclic_lengths,
+    num_reads=metacyclic_num_reads
+)
+
+# procyclic
+procyclic_utr3_df = data.frame(
+    name=genes$Name,
+    length=procyclic_lengths,
+    num_reads=procyclic_num_reads
+)
+
+# combined
+combined_utr3_df = data.frame(
+    name=genes$Name,
+    length=combined_lengths,
+    num_reads=combined_num_reads
+)
+```
+
+##### 3'UTR Composition
+
+```{r utr3_composition}
+# Metacyclic
+metacyclic_utr3_sequences = get_utr_sequences(genes, fasta, metacyclic_utr3_df, 
+                                              default_3utr_width, utr5=FALSE)
+freqs = alphabetFrequency(metacyclic_utr3_sequences)[,1:4] 
+metacyclic_utr3_features_df = data.frame(
+    name=names(metacyclic_utr3_sequences),
+    gc=(freqs[,'G'] + freqs[,'C']) / rowSums(freqs),
+    ct=(freqs[,'C'] + freqs[,'T']) / rowSums(freqs)
+)
+metacyclic_utr3_df = merge(metacyclic_utr3_df, metacyclic_utr3_features_df,
+                           by='name')
+
+# Procyclic
+procyclic_utr3_sequences = get_utr_sequences(genes, fasta, procyclic_utr3_df, 
+                                              default_3utr_width, utr5=FALSE)
+freqs = alphabetFrequency(procyclic_utr3_sequences)[,1:4] 
+procyclic_utr3_features_df = data.frame(
+    name=names(procyclic_utr3_sequences),
+    gc=(freqs[,'G'] + freqs[,'C']) / rowSums(freqs),
+    ct=(freqs[,'C'] + freqs[,'T']) / rowSums(freqs)
+)
+procyclic_utr3_df = merge(procyclic_utr3_df, procyclic_utr3_features_df,
+                          by='name')
+
+# Combined
+combined_utr3_sequences = get_utr_sequences(genes, fasta, combined_utr3_df, 
+                                              default_3utr_width, utr5=FALSE)
+freqs = alphabetFrequency(combined_utr3_sequences)[,1:4] 
+combined_utr3_features_df = data.frame(
+    name=names(combined_utr3_sequences),
+    gc=(freqs[,'G'] + freqs[,'C']) / rowSums(freqs),
+    ct=(freqs[,'C'] + freqs[,'T']) / rowSums(freqs)
+)
+combined_utr3_df = merge(combined_utr3_df, combined_utr3_features_df,
+                         by='name')
+```
+
+```{r utr3_output}
+# Write results
+write.csv(metacyclic_utr3_df, file='output/lmajor_metacyclic_3utr_lengths.csv',
+          quote=FALSE, row.names=FALSE)
+write.csv(procyclic_utr3_df, file='output/lmajor_procyclic_3utr_lengths.csv',
+          quote=FALSE, row.names=FALSE)
+write.csv(combined_utr3_df, file='output/lmajor_combined_3utr_lengths.csv',
+          quote=FALSE, row.names=FALSE)
+
+# Write result to GFF
+fp = file("output/lmajor_3utr.gff")
+writeLines(gff_lines, fp)
+close(fp)
+```
+
+Results
+-------
+
+### Length statistics
+
+#### 5'UTR length statistics
+
+```{r 5utr_length_stats}
+lengths = combined_utr5_df$length[!is.na(combined_utr5_df$length)]
+
+coverage = sum(!is.na(combined_utr5_df$length)) / nrow(combined_utr5_df)
+print(sprintf("%% 5'UTRs detected: %0.2f", coverage))
+
+quantile(lengths)
+mean(lengths)
+median(lengths)
+mode(lengths)
+hist(lengths)
+```
+
+#### 3'UTR length statistics
+
+```{r 3utr_length_stats}
+lengths = combined_utr3_df$length[!is.na(combined_utr3_df$length)]
+
+coverage = sum(!is.na(combined_utr3_df$length)) / nrow(combined_utr3_df)
+print(sprintf("%% 3'UTRs detected: %0.2f", coverage))
+
+quantile(lengths)
+mean(lengths)
+median(lengths)
+mode(lengths)
+hist(lengths)
+```
+
+### Alternative trans-splicing
+
+```{r alt_trans_splicing, fig.width=3840/96, fig.height=2160/96}
+utr5_comparison = data.frame(name=metacyclic_utr5_df$name,
+                             metacyclic=metacyclic_utr5_df$length,
+                             procyclic=procyclic_utr5_df$length,
+                             count_difference=abs(metacyclic_utr5_df$num_reads -
+                                                  procyclic_utr5_df$num_reads))
+utr5_comparison %>% ggvis(~metacyclic, ~procyclic, fill=~count_difference) %>% 
+    layer_points() %>% 
+    add_tooltip(function(df) df$name)
+
+ggplot(utr5_comparison, aes(metacyclic, procyclic, color=count_difference)) + 
+    geom_point()
+
+utr5_comparison_complete = utr5_comparison[complete.cases(utr5_comparison),]
+utr5_diff = utr5_comparison_complete[utr5_comparison_complete$metacyclic != 
+                                     utr5_comparison_complete$procyclic,]
+utr5_diff$length_diff = abs(utr5_diff$metacyclic - utr5_diff$procyclic)
+kable(head(utr5_diff[with(utr5_diff, order(length_diff, decreasing=TRUE)),], 50))
+print(sprintf("Number of alternatively trans-spliced genes: %d", nrow(utr5_diff)))
+```
+
+### Alternative poly-adenylation
+
+```{r alt_trans_polya, fig.width=3840/96, fig.height=2160/96}
+utr3_comparison = data.frame(name=metacyclic_utr3_df$name,
+                             metacyclic=metacyclic_utr3_df$length,
+                             procyclic=procyclic_utr3_df$length,
+                             count_difference=abs(metacyclic_utr3_df$num_reads -
+                                                  procyclic_utr3_df$num_reads))
+utr3_comparison %>% ggvis(~metacyclic, ~procyclic, fill=~count_difference) %>% 
+    layer_points() %>% 
+    add_tooltip(function(df) df$name)
+ggplot(utr3_comparison, aes(metacyclic, procyclic, color=count_difference)) + 
+    geom_point()
+
+utr3_comparison_complete = utr3_comparison[complete.cases(utr3_comparison),]
+utr3_diff = utr3_comparison_complete[utr3_comparison_complete$metacyclic != 
+                                     utr3_comparison_complete$procyclic,]
+utr3_diff$length_diff = abs(utr3_diff$metacyclic - utr3_diff$procyclic)
+kable(head(utr3_diff[with(utr3_diff, order(length_diff, decreasing=TRUE)),], 50))
+
+print(sprintf("Number of alternatively trans-spliced genes: %d", nrow(utr3_diff)))
+```
+
+System Information
+------------------
+
+```{r sysinfo}
+sessionInfo()
+date()
+```
