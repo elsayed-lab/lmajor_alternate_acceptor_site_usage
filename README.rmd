@@ -59,6 +59,7 @@ library(reshape2)
 gff = import.gff(file.path('/cbcb/lab/nelsayed/ref_data/lmajor_friedlin',
                            '/annotation/TriTrypDB-8.0_LmajorFriedlin.gff'),
                  version='3')
+
 chromosomes = gff[gff$type == 'chromosome']
 genes       = gff[gff$type == 'gene']
 
@@ -77,8 +78,10 @@ default_3utr_width = 575
 # Taken from L. major UTR analysis output from 2014/11/14
 procyclic_polya  = import.gff(gzfile('input/lmajor_procyclic_ncrnas_removed_polya.gff.gz'), version='3')
 metacyclic_polya = import.gff(gzfile('input/lmajor_metacyclic_ncrnas_removed_polya.gff.gz'), version='3')
+amastigote_polya = import.gff(gzfile('input/lmajor_amastigote_ncrnas_removed_polya.gff.gz'), version='3')
 procyclic_sl  = import.gff(gzfile('input/lmajor_procyclic_ncrnas_removed_sl.gff.gz'), version='3')
 metacyclic_sl = import.gff(gzfile('input/lmajor_metacyclic_ncrnas_removed_sl.gff.gz'), version='3')
+amastigote_sl = import.gff(gzfile('input/lmajor_amastigote_ncrnas_removed_sl.gff.gz'), version='3')
 
 # Create output and build directories if needed
 for (x in c('build', 'output')) {
@@ -272,13 +275,16 @@ procyclic_num_reads = c()
 metacyclic_lengths   = c()
 metacyclic_num_reads = c()
 
+amastigote_lengths   = c()
+amastigote_num_reads = c()
+
 combined_lengths   = c()
 combined_num_reads = c()
 
 # Start GFF output for combined set of acceptor sites
 gff_lines = c("##gff-version\t3",
-             "##feature-ontology\tsofa.obo",
-             "##attribute-ontology\tgff3_attributes.obo")
+              "##feature-ontology\tsofa.obo",
+              "##attribute-ontology\tgff3_attributes.obo")
 
 # Add chromosome entries
 for (i in 1:length(chromosomes)) {
@@ -325,6 +331,7 @@ for (name in genes$Name) {
     # get all of the SL acceptor sites as a GRanges object
     metacyclic_utr5 = metacyclic_sl[metacyclic_sl$Name == name]
     procyclic_utr5  = procyclic_sl[procyclic_sl$Name == name]
+    amastigote_utr5  = amastigote_sl[amastigote_sl$Name == name]
     combined_utr5   = metacyclic_sl[metacyclic_sl$Name == name]
 
     # total number of reads found which contain an acceptor site
@@ -332,11 +339,15 @@ for (name in genes$Name) {
                                   sum(metacyclic_utr5$score))
     procyclic_num_reads  = append(procyclic_num_reads,
                                   sum(procyclic_utr5$score))
+    amastigote_num_reads  = append(amastigote_num_reads,
+                                  sum(amastigote_utr5$score))
     combined_num_reads   = append(combined_num_reads,
                                   sum(procyclic_utr5$score) +
                                   sum(metacyclic_utr5$score))
     
     # Combined output
+
+    # Add procyclic reads
     if (length(procyclic_utr5) > 0) {
         for (j in 1:length(procyclic_utr5)) {
             # if new site, add a new entry
@@ -351,12 +362,28 @@ for (name in genes$Name) {
             }
         }
     }
+    # Add amastigote reads
+    if (length(amastigote_utr5) > 0) {
+        for (j in 1:length(amastigote_utr5)) {
+            # if new site, add a new entry
+            entry = amastigote_utr5[j]
+            if(!start(entry) %in% start(combined_utr5)) {
+                combined_utr5 = c(combined_utr5, entry)
+            }
+            # otherwise add amastigote score to existing metacyclic score
+            else {
+                site = combined_utr5[start(combined_utr5) == start(entry)]
+                score(site) = score(site) + score(entry)
+            }
+        }
+    }
     i = i + 1
 
-    # Determine length and scores for procyclic, metacyclic, and combined
-    # outputs
+    # Determine length and scores for procyclic, metacyclic, amastigote, 
+    # and combined outputs
     pro_site      = find_primary_site(procyclic_utr5, 'sl', gene, gene_strand)
     meta_site     = find_primary_site(metacyclic_utr5, 'sl', gene, gene_strand)
+    amast_site    = find_primary_site(amastigote_utr5, 'sl', gene, gene_strand)
     combined_site = find_primary_site(combined_utr5, 'sl', gene, gene_strand)
 
     # compute 5'utr length and coordinates
@@ -366,6 +393,9 @@ for (name in genes$Name) {
 
         # metacyclic + strand
         metacyclic_utr5_length = start(gene) - meta_site[1]
+
+        # amastigote + strand
+        amastigote_utr5_length = start(gene) - amast_site[1]
 
         # combined + strand
         combined_utr5_start  = combined_site[1] + 1
@@ -377,6 +407,9 @@ for (name in genes$Name) {
 
         # metacyclic - strand
         metacyclic_utr5_length = meta_site[1] - end(gene)
+
+        # procyclic - strand
+        amastigote_utr5_length = amast_site[1] - end(gene)
         
         # combined - strand
         combined_utr5_start  = end(gene) + 1
@@ -386,6 +419,7 @@ for (name in genes$Name) {
 
     procyclic_lengths  = append(procyclic_lengths,  procyclic_utr5_length)
     metacyclic_lengths = append(metacyclic_lengths, metacyclic_utr5_length)
+    amastigote_lengths = append(amastigote_lengths, amastigote_utr5_length)
     combined_lengths   = append(combined_lengths,   combined_utr5_length)
 
     descr = sprintf("ID=%s_5utr;Name=%s;description=%s", gene$ID, gene$Name,
@@ -417,6 +451,13 @@ procyclic_utr5_df = data.frame(
     name=genes$Name,
     length=procyclic_lengths,
     num_reads=procyclic_num_reads
+)
+
+# amastigote
+amastigote = data.frame(
+    name=genes$Name,
+    length=amastigote,
+    num_reads=amastigote
 )
 
 # combined
@@ -454,6 +495,17 @@ procyclic_utr5_features_df = data.frame(
 procyclic_utr5_df = merge(procyclic_utr5_df, procyclic_utr5_features_df,
                           by='name')
 
+# amastigote
+amastigote_utr5_sequences = get_utr_sequences(genes, fasta, amastigote_utr5_df, 
+                                              default_5utr_width, utr5=TRUE)
+freqs = alphabetFrequency(amastigote_utr5_sequences)[,1:4] 
+amastigote_utr5_features_df = data.frame(
+    name=names(amastigote_utr5_sequences),
+    gc=(freqs[,'G'] + freqs[,'C']) / rowSums(freqs),
+    ct=(freqs[,'C'] + freqs[,'T']) / rowSums(freqs)
+)
+amastigote_utr5_df = merge(amastigote_utr5_df, amastigote_utr5_features_df,
+
 # Combined
 combined_utr5_sequences = get_utr_sequences(genes, fasta, combined_utr5_df, 
                                               default_5utr_width, utr5=TRUE)
@@ -473,6 +525,8 @@ write.csv(metacyclic_utr5_df, file='output/lmajor_metacyclic_5utr_lengths.csv',
           quote=FALSE, row.names=FALSE)
 write.csv(procyclic_utr5_df, file='output/lmajor_procyclic_5utr_lengths.csv',
           quote=FALSE, row.names=FALSE)
+write.csv(amastigote_utr5_df, file='output/lmajor_amastigote_5utr_lengths.csv',
+          quote=FALSE, row.names=FALSE)
 write.csv(combined_utr5_df, file='output/lmajor_combined_5utr_lengths.csv',
           quote=FALSE, row.names=FALSE)
 
@@ -482,7 +536,7 @@ writeLines(gff_lines, fp)
 close(fp)
 ```
 
-#### 5'UTR
+#### 3'UTR
 
 ```{r compute_3utr_lengths, message=FALSE, cache=TRUE, autodep=TRUE}
 # Output columns
@@ -491,6 +545,9 @@ procyclic_num_reads = c()
 
 metacyclic_lengths   = c()
 metacyclic_num_reads = c()
+
+amastigote_lengths   = c()
+amastigote_num_reads = c()
 
 combined_lengths   = c()
 combined_num_reads = c()
@@ -542,9 +599,11 @@ for (name in genes$Name) {
     gene = genes[genes$Name == name]
 
     gene_strand = as.character(strand(gene)) 
+
     # get all of the Poly(A) acceptor sites as a GRanges object
     metacyclic_utr3 = metacyclic_polya[metacyclic_polya$Name == name]
     procyclic_utr3  = procyclic_polya[procyclic_polya$Name == name]
+    amastigote_utr3 = amastigote_polya[amastigote_polya$Name == name]
     combined_utr3   = metacyclic_polya[metacyclic_polya$Name == name]
 
     # total number of reads found which contain an acceptor site
@@ -552,6 +611,8 @@ for (name in genes$Name) {
                                   sum(metacyclic_utr3$score))
     procyclic_num_reads  = append(procyclic_num_reads,
                                   sum(procyclic_utr3$score))
+    amastigote_num_reads  = append(amastigote_num_reads,
+                                  sum(amastigote_utr3$score))
     combined_num_reads   = append(combined_num_reads,
                                   sum(procyclic_utr3$score) +
                                   sum(metacyclic_utr3$score))
@@ -571,12 +632,27 @@ for (name in genes$Name) {
             }
         }
     }
+    if (length(amastigote_utr3) > 0) {
+        for (j in 1:length(amastigote_utr3)) {
+            # if new site, add a new entry
+            entry = amastigote_utr3[j]
+            if(!start(entry) %in% start(combined_utr3)) {
+                combined_utr3 = c(combined_utr3, entry)
+            }
+            # otherwise add amastigote score to existing metacyclic score
+            else {
+                site = combined_utr3[start(combined_utr3) == start(entry)]
+                score(site) = score(site) + score(entry)
+            }
+        }
+    }
     i = i + 1
 
     # Determine length and scores for procyclic, metacyclic, and combined
     # outputs
     pro_site      = find_primary_site(procyclic_utr3, 'polya', gene, gene_strand)
     meta_site     = find_primary_site(metacyclic_utr3, 'polya', gene, gene_strand)
+    amast_site    = find_primary_site(amastigote_utr3, 'polya', gene, gene_strand)
     combined_site = find_primary_site(combined_utr3, 'polya', gene, gene_strand)
 
     # compute 3'utr length and coordinates
@@ -586,6 +662,9 @@ for (name in genes$Name) {
 
         # metacyclic + strand
         metacyclic_utr3_length = meta_site[1] - end(gene)
+        
+        # amastigote + strand
+        amastigote_utr3_length = amast_site[1] - end(gene)
 
         # combined + strand
         combined_utr3_start  = end(gene) + 1
@@ -597,6 +676,9 @@ for (name in genes$Name) {
 
         # metacyclic - strand
         metacyclic_utr3_length = start(gene) - meta_site[1]
+
+        # amastigote - strand
+        amastigote_utr3_length = start(gene) - amast_site[1]
         
         # combined - strand
         combined_utr3_start  = combined_site[1] + 1
@@ -606,6 +688,7 @@ for (name in genes$Name) {
 
     procyclic_lengths  = append(procyclic_lengths,  procyclic_utr3_length)
     metacyclic_lengths = append(metacyclic_lengths, metacyclic_utr3_length)
+    amastigote_lengths = append(amastigote_lengths,  amastigote_utr3_length)
     combined_lengths   = append(combined_lengths,   combined_utr3_length)
 
     descr = sprintf("ID=%s_3utr;Name=%s;description=%s", gene$ID, gene$Name,
@@ -637,6 +720,13 @@ procyclic_utr3_df = data.frame(
     name=genes$Name,
     length=procyclic_lengths,
     num_reads=procyclic_num_reads
+)
+
+# amastigote
+amastigote_utr3_df = data.frame(
+    name=genes$Name,
+    length=amastigote_lengths,
+    num_reads=amastigote_num_reads
 )
 
 # combined
@@ -674,6 +764,17 @@ procyclic_utr3_features_df = data.frame(
 procyclic_utr3_df = merge(procyclic_utr3_df, procyclic_utr3_features_df,
                           by='name')
 
+# amastigote
+amastigote_utr3_sequences = get_utr_sequences(genes, fasta, amastigote_utr3_df, 
+                                              default_3utr_width, utr5=FALSE)
+freqs = alphabetFrequency(amastigote_utr3_sequences)[,1:4] 
+amastigote_utr3_features_df = data.frame(
+    name=names(amastigote_utr3_sequences),
+    gc=(freqs[,'G'] + freqs[,'C']) / rowSums(freqs),
+    ct=(freqs[,'C'] + freqs[,'T']) / rowSums(freqs)
+)
+amastigote_utr3_df = merge(amastigote_utr3_df, amastigote_utr3_features_df,
+                          by='name')
 # Combined
 combined_utr3_sequences = get_utr_sequences(genes, fasta, combined_utr3_df, 
                                               default_3utr_width, utr5=FALSE)
@@ -692,6 +793,8 @@ combined_utr3_df = merge(combined_utr3_df, combined_utr3_features_df,
 write.csv(metacyclic_utr3_df, file='output/lmajor_metacyclic_3utr_lengths.csv',
           quote=FALSE, row.names=FALSE)
 write.csv(procyclic_utr3_df, file='output/lmajor_procyclic_3utr_lengths.csv',
+          quote=FALSE, row.names=FALSE)
+write.csv(amastigote_utr3_df, file='output/lmajor_amastigote_3utr_lengths.csv',
           quote=FALSE, row.names=FALSE)
 write.csv(combined_utr3_df, file='output/lmajor_combined_3utr_lengths.csv',
           quote=FALSE, row.names=FALSE)
@@ -739,7 +842,10 @@ hist(lengths)
 
 ### Alternative trans-splicing
 
-```{r alt_trans_splicing, fig.width=3840/96, fig.height=2160/96}
+#### Metacyclic vs. Procyclic
+
+```{r alt_trans_splicing_meta_vs_pro, fig.width=3840/96, fig.height=2160/96}
+# metacyclic vs. procyclic
 utr5_comparison = data.frame(name=metacyclic_utr5_df$name,
                              metacyclic=metacyclic_utr5_df$length,
                              procyclic=procyclic_utr5_df$length,
@@ -757,12 +863,63 @@ utr5_diff = utr5_comparison_complete[utr5_comparison_complete$metacyclic !=
                                      utr5_comparison_complete$procyclic,]
 utr5_diff$length_diff = abs(utr5_diff$metacyclic - utr5_diff$procyclic)
 kable(head(utr5_diff[with(utr5_diff, order(length_diff, decreasing=TRUE)),], 50))
-print(sprintf("Number of alternatively trans-spliced genes: %d", nrow(utr5_diff)))
+print(sprintf("Number of alternatively trans-spliced genes (meta vs. pro): %d",
+              nrow(utr5_diff)))
+```
+
+#### Metacyclic vs. Amastigote
+
+```{r alt_trans_splicing_meta_vs_amast}
+utr5_comparison = data.frame(name=metacyclic_utr5_df$name,
+                             metacyclic=metacyclic_utr5_df$length,
+                             amastigote=amastigote_utr5_df$length,
+                             count_difference=abs(metacyclic_utr5_df$num_reads -
+                                                  amastigote_utr5_df$num_reads))
+utr5_comparison %>% ggvis(~metacyclic, ~amastigote, fill=~count_difference) %>% 
+    layer_points() %>% 
+    add_tooltip(function(df) df$name)
+
+ggplot(utr5_comparison, aes(metacyclic, amastigote, color=count_difference)) + 
+    geom_point()
+
+utr5_comparison_complete = utr5_comparison[complete.cases(utr5_comparison),]
+utr5_diff = utr5_comparison_complete[utr5_comparison_complete$metacyclic != 
+                                     utr5_comparison_complete$amastigote,]
+utr5_diff$length_diff = abs(utr5_diff$metacyclic - utr5_diff$amastigote)
+kable(head(utr5_diff[with(utr5_diff, order(length_diff, decreasing=TRUE)),], 50))
+print(sprintf("Number of alternatively trans-spliced genes (meta vs. amast): %d",
+              nrow(utr5_diff)))
+```
+
+#### Procyclic vs. Amastigote
+
+```{r alt_trans_splicing_pro_vs_amast}
+utr5_comparison = data.frame(name=procyclic_utr5_df$name,
+                             procyclic=procyclic_utr5_df$length,
+                             amastigote=amastigote_utr5_df$length,
+                             count_difference=abs(procyclic_utr5_df$num_reads -
+                                                  amastigote_utr5_df$num_reads))
+utr5_comparison %>% ggvis(~procyclic, ~amastigote, fill=~count_difference) %>% 
+    layer_points() %>% 
+    add_tooltip(function(df) df$name)
+
+ggplot(utr5_comparison, aes(procyclic, amastigote, color=count_difference)) + 
+    geom_point()
+
+utr5_comparison_complete = utr5_comparison[complete.cases(utr5_comparison),]
+utr5_diff = utr5_comparison_complete[utr5_comparison_complete$procyclic != 
+                                     utr5_comparison_complete$amastigote,]
+utr5_diff$length_diff = abs(utr5_diff$procyclic - utr5_diff$amastigote)
+kable(head(utr5_diff[with(utr5_diff, order(length_diff, decreasing=TRUE)),], 50))
+print(sprintf("Number of alternatively trans-spliced genes (pro vs. amast): %d",
+              nrow(utr5_diff)))
 ```
 
 ### Alternative poly-adenylation
 
-```{r alt_trans_polya, fig.width=3840/96, fig.height=2160/96}
+#### Metacyclic vs. Procyclic
+
+```{r alt_polya_meta_vs_pro, fig.width=3840/96, fig.height=2160/96}
 utr3_comparison = data.frame(name=metacyclic_utr3_df$name,
                              metacyclic=metacyclic_utr3_df$length,
                              procyclic=procyclic_utr3_df$length,
@@ -780,7 +937,56 @@ utr3_diff = utr3_comparison_complete[utr3_comparison_complete$metacyclic !=
 utr3_diff$length_diff = abs(utr3_diff$metacyclic - utr3_diff$procyclic)
 kable(head(utr3_diff[with(utr3_diff, order(length_diff, decreasing=TRUE)),], 50))
 
-print(sprintf("Number of alternatively trans-spliced genes: %d", nrow(utr3_diff)))
+print(sprintf("Number of alternatively trans-spliced genes (meta vs. pro): %d",
+              nrow(utr3_diff)))
+```
+
+#### Metacyclic vs. Amastigote
+
+```{r alt_polya_meta_vs_amast, fig.width=3840/96, fig.height=2160/96}
+utr3_comparison = data.frame(name=metacyclic_utr3_df$name,
+                             metacyclic=metacyclic_utr3_df$length,
+                             amastigote=amastigote_utr3_df$length,
+                             count_difference=abs(metacyclic_utr3_df$num_reads -
+                                                  amastigote_utr3_df$num_reads))
+utr3_comparison %>% ggvis(~metacyclic, ~amastigote, fill=~count_difference) %>% 
+    layer_points() %>% 
+    add_tooltip(function(df) df$name)
+ggplot(utr3_comparison, aes(metacyclic, amastigote, color=count_difference)) + 
+    geom_point()
+
+utr3_comparison_complete = utr3_comparison[complete.cases(utr3_comparison),]
+utr3_diff = utr3_comparison_complete[utr3_comparison_complete$metacyclic != 
+                                     utr3_comparison_complete$amastigote,]
+utr3_diff$length_diff = abs(utr3_diff$metacyclic - utr3_diff$amastigote)
+kable(head(utr3_diff[with(utr3_diff, order(length_diff, decreasing=TRUE)),], 50))
+
+print(sprintf("Number of alternatively trans-spliced genes (meta vs. amast): %d",
+              nrow(utr3_diff)))
+```
+
+#### Procyclic vs. Amastigote
+
+```{r alt_polya_pro_vs_amast, fig.width=3840/96, fig.height=2160/96}
+utr3_comparison = data.frame(name=procyclic_utr3_df$name,
+                             procyclic=procyclic_utr3_df$length,
+                             amastigote=amastigote_utr3_df$length,
+                             count_difference=abs(procyclic_utr3_df$num_reads -
+                                                  amastigote_utr3_df$num_reads))
+utr3_comparison %>% ggvis(~procyclic, ~amastigote, fill=~count_difference) %>% 
+    layer_points() %>% 
+    add_tooltip(function(df) df$name)
+ggplot(utr3_comparison, aes(procyclic, amastigote, color=count_difference)) + 
+    geom_point()
+
+utr3_comparison_complete = utr3_comparison[complete.cases(utr3_comparison),]
+utr3_diff = utr3_comparison_complete[utr3_comparison_complete$procyclic != 
+                                     utr3_comparison_complete$amastigote,]
+utr3_diff$length_diff = abs(utr3_diff$procyclic - utr3_diff$amastigote)
+kable(head(utr3_diff[with(utr3_diff, order(length_diff, decreasing=TRUE)),], 50))
+
+print(sprintf("Number of alternatively trans-spliced genes (pro vs. amast): %d",
+              nrow(utr3_diff)))
 ```
 
 System Information
