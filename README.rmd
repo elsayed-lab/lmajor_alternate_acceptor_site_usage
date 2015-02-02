@@ -1,28 +1,40 @@
 ---
+title: "L. major UTR Analysis"
 output:
   knitrBootstrap::bootstrap_document:
-    title: "L. major Acceptor Site Smoothing and Primary UTR detection"
     theme: flatly
 ---
 
 ```{r knitr_settings, include=FALSE}
 library(knitr)
-opts_chunk$set(fig.width=1920/96,
-               fig.height=1080/96,
+opts_chunk$set(fig.width=1280/96,
+               fig.height=720/96,
                dpi=96)
 ```
 
-L. major Acceptor Site Smoothing and Primary UTR detection
-==========================================================
+L. major UTR Length and Alternative Trans-splicing / Poly-adenylation Analysis
+==============================================================================
 
 Overview
 --------
 
 The goal of this analysis is to parse the output from our [UTR analysis
-pipeline](https://github.com/khughitt/utr_analysis) and to perform some basic
-smoothing of the spliced leader and polya acceptor site counts, and determine
+pipeline](https://github.com/khughitt/utr_analysis), perform some basic
+smoothing of the spliced leader and polya acceptor site counts and determine
 the most likely primary UTR boundaries for each gene where information is
-available.
+available. 5'- and 3'-UTR boundaries, along with some other useful information
+such as UTR GC- and CT-richness will be outputted in a format that is
+convenient for downstream analysis.
+
+Finally, we will look for evidence of either alternative trans-splicing or
+poly-adenylation and attempt to visualize the prevelance and magnitude of
+these events across the different developmental stages.
+
+TODO
+----
+
+- Include Trey's uORFs
+- Removal RNAs (SLRNA, etc)
 
 ```{r run_date, results='asis', echo=FALSE}
 email = "<a href='mailto:khughitt@umd.edu'>Keith Hughitt</a>"
@@ -37,6 +49,10 @@ Settings
 --------
 
 ```{r settings}
+# Number of individual UTR plots to display for each developmental stage and
+# UTR side. The purpose of these plots are to provide a sense of the data
+# distribution and to visualize the effect of primary # site selection with and
+# without smoothing.
 max_plots = 10
 ```
 
@@ -54,6 +70,7 @@ library(rtracklayer)
 library(ggplot2)
 library(ggvis)
 library(reshape2)
+library(dplyr)
 
 # Genome sequence and annotations from TriTrypDB (8.0)
 gff = import.gff(file.path('/cbcb/lab/nelsayed/ref_data/lmajor_friedlin',
@@ -62,6 +79,17 @@ gff = import.gff(file.path('/cbcb/lab/nelsayed/ref_data/lmajor_friedlin',
 
 chromosomes = gff[gff$type == 'chromosome']
 genes       = gff[gff$type == 'gene']
+
+# Load unannotated ORFs detected from ribosome profiling data
+uorfs = import.gff(gzfile('input/lmajor_orfs_manual_2014-09-08_clean.gff.gz'), version='3')
+uorfs$description = 'Unannotated ORF'
+
+# Drop GFF columns not shared betwene TriTrypDB GFF and uORF GFF
+keep_cols = intersect(colnames(mcols(genes)), colnames(mcols(uorfs)))
+genes = genes[,keep_cols]
+uorfs = uorfs[,keep_cols]
+
+genes = append(genes, uorfs)
 
 input_fasta = file.path(Sys.getenv("REF"), 
                         "lmajor_friedlin/genome/TriTrypDB-8.0_LmajorFriedlin_Genome.fasta")
@@ -83,6 +111,18 @@ procyclic_sl  = import.gff(gzfile('input/lmajor_procyclic_ncrnas_removed_sl.gff.
 metacyclic_sl = import.gff(gzfile('input/lmajor_metacyclic_ncrnas_removed_sl.gff.gz'), version='3')
 amastigote_sl = import.gff(gzfile('input/lmajor_amastigote_ncrnas_removed_sl.gff.gz'), version='3')
 
+# Filter noncoding RNAs
+id_filter_string = 'rRNA|snRNA|snoRNA|SLRNA|TRNA|SRP'
+noncoding_ids = genes$ID[grepl(id_filter_string, genes$ID)]
+
+genes            = genes[!genes$ID %in% noncoding_ids]
+procyclic_polya  = procyclic_polya[!procyclic_polya$Name %in% noncoding_ids,]
+metacyclic_polya = metacyclic_polya[!metacyclic_polya$Name %in% noncoding_ids,]
+amastigote_polya = amastigote_polya[!amastigote_polya$Name %in% noncoding_ids,]
+procyclic_sl     = procyclic_sl[!procyclic_sl$Name %in% noncoding_ids,]
+metacyclic_sl    = metacyclic_sl[!metacyclic_sl$Name %in% noncoding_ids,]
+amastigote_sl    = amastigote_sl[!amastigote_sl$Name %in% noncoding_ids,]
+
 # Create output and build directories if needed
 for (x in c('build', 'output')) {
     if (!file.exists(x)) {
@@ -96,7 +136,7 @@ for (x in c('build', 'output')) {
 # find_peak
 #
 find_peak = function(gene, acceptor_sites, gene_strand, feature_type,
-                     smoothed=FALSE, include_plot=FALSE) {
+                     smoothed=FALSE, include_plot=FALSE, secondary=FALSE) {
     # Determine orientation of feature relative to CDS
     if ((feature_type == 'sl'    && gene_strand == '+') ||
         (feature_type == 'polya' && gene_strand == '-')) {
@@ -129,36 +169,45 @@ find_peak = function(gene, acceptor_sites, gene_strand, feature_type,
     }
 
     # find acceptor site peak
-    j = 1
+    if (secondary && (length(acceptor_sites) >= 2)) {
+        # secondary site
+        j = 2
+    } else {
+        # primary site
+        j = 1
+    }
     sorted_scores = sort(input_scores, decreasing=TRUE)
-    max_score_idx = which(input_scores == sorted_scores[j])
+    raw_idx       = which(input_scores == sorted_scores[j])
 
-    if (length(max_score_idx) > 1) {
+    if (length(raw_idx) > 1) {
         if (feature_side == 'left') {
-            max_score_idx = head(max_score_idx, 1)
+            raw_idx = head(raw_idx, 1)
         } else {
-            max_score_idx = tail(max_score_idx, 1)
+            raw_idx = tail(raw_idx, 1)
         }
     }
-    max_raw = raw_scores[max_score_idx]
+
+    # find raw score (number of reads) for the desired primary or secondary
+    # site peak
+    raw_score = raw_scores[raw_idx]
 
     # If smoothing was used, the actual location of the smoothed peak may not
     # have any support. In this case we will find the nearest site to the peak
     # with a non-zero score in the raw scores vector
-    while(max_raw == 0) {
+    while(raw_score == 0) {
         # find next highest peak
         j = j + 1 
-        max_score_idx = which(input_scores == sorted_scores[j])
+        raw_idx = which(input_scores == sorted_scores[j])
 
         # if more than one peak, choose the furthest one from CDS
-        if (length(max_score_idx) > 1) {
+        if (length(raw_idx) > 1) {
             if (feature_side == 'left') {
-                max_score_idx = head(max_score_idx, 1)
+                raw_idx = head(raw_idx, 1)
             } else {
-                max_score_idx = tail(max_score_idx, 1)
+                raw_idx = tail(raw_idx, 1)
             }
         }
-        max_raw = raw_scores[max_score_idx]
+        raw_score = raw_scores[raw_idx]
     }
 
     # plot raw and smoothed peaks
@@ -176,18 +225,19 @@ find_peak = function(gene, acceptor_sites, gene_strand, feature_type,
         }
     }
 
-    # find index of the site with the highest score
-    max_index = which(score(acceptor_sites) == max_raw)
+    # find index of the site with the highest score (or second highest score,
+    # in the case of secondary site selection)
+    idx = which(score(acceptor_sites) == raw_score)
 
     # if there is a tie, use the furthest site from CDS
-    if (length(max_index) > 1) {
+    if (length(idx) > 1) {
         if (feature_side == 'left') {
-            max_index = head(max_index, 1)
+            idx = head(idx, 1)
         } else {
-            max_index = tail(max_index, 1)
+            idx = tail(idx, 1)
         }
     }
-    return(max_index)
+    return(idx)
 }
 
 #
@@ -196,12 +246,15 @@ find_peak = function(gene, acceptor_sites, gene_strand, feature_type,
 # Determines the primary site among a list of acceptor sites and their
 # associated score (number of reads mapped).
 #
+# Returns a list containing the site and score for the primary site.
+#
 find_primary_site = function(acceptor_sites, feature, gene, gene_strand, smoothed=FALSE) {
     if (length(acceptor_sites) == 0) {
-        return(c(NA, NA))
+        return(list(location=NA, num_reads=NA))
     } else if (length(acceptor_sites) == 1) {
         # if only one site found, use it
-        return(c(start(acceptor_sites)[1], score(acceptor_sites)[1]))
+        return(list(location=start(acceptor_sites)[1],
+                    num_reads=score(acceptor_sites)[1]))
     } else {
         # two or more sites
 
@@ -217,14 +270,61 @@ find_primary_site = function(acceptor_sites, feature, gene, gene_strand, smoothe
         if (abs(max_index - max_index_smoothed) > 15) {
             num_diff = num_diff + 1
             if (plot_num <= max_plots) {
-                tmp = find_peak(gene, acceptor_sites, gene_strand, feature,
-                                smoothed=TRUE, include_plot=TRUE)
+                sprintf("PLOTTING %d/%d", plot_num, max_plots)
+                #tmp = find_peak(gene, acceptor_sites, gene_strand, feature,
+                #                smoothed=TRUE, include_plot=TRUE)
                 plot_num = plot_num + 1
             }
         }
 
-        return(c(start(acceptor_sites)[max_index], 
-                 score(acceptor_sites)[max_index]))
+        return(list(location=start(acceptor_sites)[max_index], 
+                    num_reads=score(acceptor_sites)[max_index]))
+    }
+}
+
+#
+# find_secondary_site
+#
+# Determines the secondary site among a list of acceptor sites and their
+# associated score (number of reads mapped).
+#
+# Returns a list containing the site and score for the secondary site.
+#
+find_secondary_site = function(acceptor_sites, feature, gene, gene_strand,
+                               smoothed=FALSE) {
+    if (length(acceptor_sites) == 0) {
+        return(list(location=NA, num_reads=NA))
+    } else if (length(acceptor_sites) == 1) {
+        # if only one site found, use it
+        return(list(location=start(acceptor_sites)[1],
+                    num_reads=score(acceptor_sites)[1]))
+    } else {
+        # two or more sites
+
+        # find highest smoothed peak which has non-zero coverage in the raw
+        # data as well
+        secondary_site_index = find_peak(gene, acceptor_sites, gene_strand,
+                                         feature, smoothed=smoothed,
+                                         secondary=TRUE)
+        secondary_site_index_smoothed = find_peak(gene, acceptor_sites,
+                                                  gene_strand, feature,
+                                                  smoothed=TRUE,
+                                                  secondary=TRUE)
+
+        # if the smoothing would result in a different secondary UTR choice,
+        # plot the raw and smoothed versions of the data
+        #if (abs(secondary_site_index - secondary_site_index_smoothed) > 15) {
+        #    num_diff = num_diff + 1
+        #    if (plot_num <= max_plots) {
+        #        tmp = find_peak(gene, acceptor_sites, gene_strand, feature,
+        #                        smoothed=TRUE, include_plot=TRUE,
+        #                        secondary=TRUE)
+        #        plot_num = plot_num + 1
+        #    }
+        #}
+
+        return(list(location=start(acceptor_sites)[secondary_site_index], 
+                    num_reads=score(acceptor_sites)[secondary_site_index]))
     }
 }
 
@@ -253,11 +353,33 @@ get_utr_sequences = function(genes, fasta, utr_lengths, default_width,
     pos_strand = utr[as.character(strand(utr)) == "+"]
     neg_strand = utr[as.character(strand(utr)) == "-"]
 
+    # for genes that were assigned the default UTR size, make sure that the                                                                                                               
+    # assigned boundaries fall within the chromosome                                                                                                                                      
+    start(pos_strand) = pmax(1, start(pos_strand))                                                                                                                                        
+    start(neg_strand) = pmax(1, start(neg_strand))                                                                                                                                        
+
+    end(pos_strand) = pmin(end(pos_strand), width(fasta[seqnames(pos_strand)]))                                                                                                           
+    end(neg_strand) = pmin(end(neg_strand), width(fasta[seqnames(neg_strand)]))  
+
     seqs = fasta[pos_strand]
     seqs = append(seqs, reverseComplement(fasta[neg_strand]))
     names(seqs) = c(pos_strand$ID, neg_strand$ID)
 
     return(seqs)
+}
+
+#
+# get_num_reads
+#
+# Returns the number of reads mapped to a given position for the specified
+# stage, or 0 if none are found
+#
+get_num_reads = function(utr_reads, site) {
+    if (is.na(site)) {
+        return(NA)
+    }
+    num_reads = score(utr_reads[start(utr_reads) == site])
+    return(ifelse(length(num_reads) == 0, 0, num_reads))
 }
 ```
 
@@ -269,17 +391,44 @@ get_utr_sequences = function(genes, fasta, utr_lengths, default_width,
 
 ```{r compute_5utr_lengths, message=FALSE, cache=TRUE, autodep=TRUE}
 # Output columns
-procyclic_lengths   = c()
-procyclic_num_reads = c()
+procyclic_lengths             = c()
+procyclic_num_reads           = c()
+procyclic_num_reads_primary   = c()
+procyclic_num_reads_secondary = c()
 
-metacyclic_lengths   = c()
-metacyclic_num_reads = c()
+metacyclic_lengths             = c()
+metacyclic_num_reads           = c()
+metacyclic_num_reads_primary   = c()
+metacyclic_num_reads_secondary = c()
 
-amastigote_lengths   = c()
-amastigote_num_reads = c()
+amastigote_lengths             = c()
+amastigote_num_reads           = c()
+amastigote_num_reads_primary   = c()
+amastigote_num_reads_secondary = c()
 
-combined_lengths   = c()
-combined_num_reads = c()
+combined_lengths             = c()
+combined_num_reads           = c()
+combined_num_reads_primary   = c()
+combined_num_reads_secondary = c()
+
+# Vectors to keep track of stage-specific primary site coverage across
+# different stages (e.g. amastigote primary site reads in procyclic samples)
+# This will be useful later on when looking for evidence of alternative trans-
+# splicing and polyadenylation.
+#
+# For example, "pro_meta_primary_sl_reads" will contain the number of
+# metacyclic reads mapped to the metacyclic primary site.
+#
+# Note 2015/01/15 -- for now, we will use the simpler "primary to secondary"
+# ratios *within* each condition to give a sense of the degree of "dominance"
+# for a given primary site.
+#
+pro_meta_primary_sl_reads = c()
+pro_amast_primary_sl_reads = c()
+meta_pro_primary_sl_reads = c()
+meta_amast_primary_sl_reads = c()
+amast_pro_primary_sl_reads = c()
+amast_meta_primary_sl_reads = c()
 
 # Start GFF output for combined set of acceptor sites
 gff_lines = c("##gff-version\t3",
@@ -323,16 +472,16 @@ plot_num = 0
 
 # Add gene entries
 i = 1
-for (name in genes$Name) {
+for (gene_id in genes$ID) {
     message(sprintf("Processing SL sites for gene %d/%d", i, length(genes)))
-    gene = genes[genes$Name == name]
+    gene = genes[genes$ID == gene_id]
 
     gene_strand = as.character(strand(gene)) 
     # get all of the SL acceptor sites as a GRanges object
-    metacyclic_utr5 = metacyclic_sl[metacyclic_sl$Name == name]
-    procyclic_utr5  = procyclic_sl[procyclic_sl$Name == name]
-    amastigote_utr5  = amastigote_sl[amastigote_sl$Name == name]
-    combined_utr5   = metacyclic_sl[metacyclic_sl$Name == name]
+    metacyclic_utr5 = metacyclic_sl[metacyclic_sl$Name == gene_id]
+    procyclic_utr5  = procyclic_sl[procyclic_sl$Name == gene_id]
+    amastigote_utr5  = amastigote_sl[amastigote_sl$Name == gene_id]
+    combined_utr5   = metacyclic_sl[metacyclic_sl$Name == gene_id]
 
     # total number of reads found which contain an acceptor site
     metacyclic_num_reads = append(metacyclic_num_reads, 
@@ -343,7 +492,8 @@ for (name in genes$Name) {
                                   sum(amastigote_utr5$score))
     combined_num_reads   = append(combined_num_reads,
                                   sum(procyclic_utr5$score) +
-                                  sum(metacyclic_utr5$score))
+                                  sum(metacyclic_utr5$score) +
+                                  sum(amastigote_utr5$score))
     
     # Combined output
 
@@ -357,8 +507,9 @@ for (name in genes$Name) {
             }
             # otherwise add procyclic score to existing metacyclic score
             else {
-                site = combined_utr5[start(combined_utr5) == start(entry)]
-                score(site) = score(site) + score(entry)
+                score(combined_utr5[start(combined_utr5) == start(entry)]) = (
+                    score(combined_utr5[start(combined_utr5) == start(entry)]) +
+                    score(entry))
             }
         }
     }
@@ -372,8 +523,9 @@ for (name in genes$Name) {
             }
             # otherwise add amastigote score to existing metacyclic score
             else {
-                site = combined_utr5[start(combined_utr5) == start(entry)]
-                score(site) = score(site) + score(entry)
+                score(combined_utr5[start(combined_utr5) == start(entry)]) = (
+                    score(combined_utr5[start(combined_utr5) == start(entry)]) +
+                    score(entry))
             }
         }
     }
@@ -381,48 +533,88 @@ for (name in genes$Name) {
 
     # Determine length and scores for procyclic, metacyclic, amastigote, 
     # and combined outputs
-    pro_site      = find_primary_site(procyclic_utr5, 'sl', gene, gene_strand)
-    meta_site     = find_primary_site(metacyclic_utr5, 'sl', gene, gene_strand)
-    amast_site    = find_primary_site(amastigote_utr5, 'sl', gene, gene_strand)
-    combined_site = find_primary_site(combined_utr5, 'sl', gene, gene_strand)
+    pro_primary_site      = find_primary_site(procyclic_utr5, 'sl', gene, gene_strand)
+    meta_primary_site     = find_primary_site(metacyclic_utr5, 'sl', gene, gene_strand)
+    amast_primary_site    = find_primary_site(amastigote_utr5, 'sl', gene, gene_strand)
+    combined_primary_site = find_primary_site(combined_utr5, 'sl', gene, gene_strand)
+
+    # secondary site
+    pro_secondary_site      = find_secondary_site(procyclic_utr5, 'sl', gene, gene_strand)
+    meta_secondary_site     = find_secondary_site(metacyclic_utr5, 'sl', gene, gene_strand)
+    amast_secondary_site    = find_secondary_site(amastigote_utr5, 'sl', gene, gene_strand)
+    combined_secondary_site = find_secondary_site(combined_utr5, 'sl', gene, gene_strand)
 
     # compute 5'utr length and coordinates
     if (gene_strand == '+') {
         # procylic + strand
-        procyclic_utr5_length = start(gene) - pro_site[1]
+        procyclic_utr5_length = start(gene) - pro_primary_site$location
 
         # metacyclic + strand
-        metacyclic_utr5_length = start(gene) - meta_site[1]
+        metacyclic_utr5_length = start(gene) - meta_primary_site$location
 
         # amastigote + strand
-        amastigote_utr5_length = start(gene) - amast_site[1]
+        amastigote_utr5_length = start(gene) - amast_primary_site$location
 
         # combined + strand
-        combined_utr5_start  = combined_site[1] + 1
+        combined_utr5_start  = combined_primary_site$location + 1
         combined_utr5_end    = start(gene) - 1
-        combined_utr5_length = start(gene) - combined_site[1]
+        combined_utr5_length = start(gene) - combined_primary_site$location
     } else {
         # procyclic - strand
-        procyclic_utr5_length = pro_site[1] - end(gene)
+        procyclic_utr5_length = pro_primary_site$location - end(gene)
 
         # metacyclic - strand
-        metacyclic_utr5_length = meta_site[1] - end(gene)
+        metacyclic_utr5_length = meta_primary_site$location - end(gene)
 
         # procyclic - strand
-        amastigote_utr5_length = amast_site[1] - end(gene)
+        amastigote_utr5_length = amast_primary_site$location - end(gene)
         
         # combined - strand
         combined_utr5_start  = end(gene) + 1
-        combined_utr5_end    = combined_site[1] - 1
-        combined_utr5_length = combined_site[1] - end(gene)
+        combined_utr5_end    = combined_primary_site$location - 1
+        combined_utr5_length = combined_primary_site$location - end(gene)
     }
 
+    # Add primary site read count and UTR length
     procyclic_lengths  = append(procyclic_lengths,  procyclic_utr5_length)
     metacyclic_lengths = append(metacyclic_lengths, metacyclic_utr5_length)
     amastigote_lengths = append(amastigote_lengths, amastigote_utr5_length)
     combined_lengths   = append(combined_lengths,   combined_utr5_length)
 
-    descr = sprintf("ID=%s_5utr;Name=%s;description=%s", gene$ID, gene$Name,
+    procyclic_num_reads_primary  = append(procyclic_num_reads_primary,
+                                          pro_primary_site$num_reads)
+    metacyclic_num_reads_primary = append(metacyclic_num_reads_primary,
+                                          meta_primary_site$num_reads)
+    amastigote_num_reads_primary = append(amastigote_num_reads_primary,
+                                          amast_primary_site$num_reads)
+    combined_num_reads_primary   = append(combined_num_reads_primary,
+                                          combined_primary_site$num_reads)
+
+    procyclic_num_reads_secondary  = append(procyclic_num_reads_secondary,
+                                            pro_secondary_site$num_reads)
+    metacyclic_num_reads_secondary = append(metacyclic_num_reads_secondary,
+                                            meta_secondary_site$num_reads)
+    amastigote_num_reads_secondary = append(amastigote_num_reads_secondary,
+                                            amast_secondary_site$num_reads)
+    combined_num_reads_secondary   = append(combined_num_reads_secondary,
+                                            combined_secondary_site$num_reads)
+
+    # Update counts for cross-stage primary sites
+    pro_meta_primary_sl_reads = append(pro_meta_primary_sl_reads,
+                                 get_num_reads(procyclic_utr5, meta_primary_site$location))
+    pro_amast_primary_sl_reads = append(pro_amast_primary_sl_reads,
+                                 get_num_reads(procyclic_utr5, amast_primary_site$location))
+    meta_pro_primary_sl_reads = append(meta_pro_primary_sl_reads,
+                                 get_num_reads(metacyclic_utr5, pro_primary_site$location))
+    meta_amast_primary_sl_reads = append(meta_amast_primary_sl_reads,
+                                 get_num_reads(metacyclic_utr5, amast_primary_site$location))
+    amast_pro_primary_sl_reads = append(amast_pro_primary_sl_reads,
+                                 get_num_reads(amastigote_utr5, pro_primary_site$location))
+    amast_meta_primary_sl_reads = append(amast_meta_primary_sl_reads,
+                                 get_num_reads(amastigote_utr5, meta_primary_site$location))
+
+    # Add GFF entry
+    descr = sprintf("ID=%s_5utr;Name=%s;description=%s", gene$ID, gene$ID,
                     gene$description)
 
     gff_entry = paste(
@@ -431,7 +623,7 @@ for (name in genes$Name) {
         "five_prime_UTR",
         combined_utr5_start,
         combined_utr5_end,
-        combined_site[2],
+        combined_primary_site$num_reads,
         strand(gene),
         '.',
         descr, sep='\t')
@@ -441,31 +633,60 @@ for (name in genes$Name) {
 
 # metacyclic
 metacyclic_utr5_df = data.frame(
-    name=genes$Name,
+    name=genes$ID,
     length=metacyclic_lengths,
-    num_reads=metacyclic_num_reads
+    num_reads=metacyclic_num_reads,
+    num_reads_primary=metacyclic_num_reads_primary,
+    num_reads_secondary=metacyclic_num_reads_secondary
 )
 
 # procyclic
 procyclic_utr5_df = data.frame(
-    name=genes$Name,
+    name=genes$ID,
     length=procyclic_lengths,
-    num_reads=procyclic_num_reads
+    num_reads=procyclic_num_reads,
+    num_reads_primary=procyclic_num_reads_primary,
+    num_reads_secondary=procyclic_num_reads_secondary
 )
 
 # amastigote
-amastigote = data.frame(
-    name=genes$Name,
-    length=amastigote,
-    num_reads=amastigote
+amastigote_utr5_df = data.frame(
+    name=genes$ID,
+    length=amastigote_lengths,
+    num_reads=amastigote_num_reads,
+    num_reads_primary=amastigote_num_reads_primary,
+    num_reads_secondary=amastigote_num_reads_secondary
 )
 
 # combined
 combined_utr5_df = data.frame(
-    name=genes$Name,
+    name=genes$ID,
     length=combined_lengths,
-    num_reads=combined_num_reads
+    num_reads=combined_num_reads,
+    num_reads_primary=combined_num_reads_primary,
+    num_reads_secondary=combined_num_reads_secondary
 )
+
+# Create cross-stage site usage dataframes
+# For example, "pro_other_sl_sites"  lists the number of procyclic reads 
+# which mapped to the primary sites detected for other stages (amast and meta).
+pro_other_sl_sites = tbl_df(data.frame(
+   gene=genes$ID,
+   metacyclic=pro_meta_primary_sl_reads,
+   amastigote=pro_amast_primary_sl_reads
+))
+
+meta_other_sl_sites = tbl_df(data.frame(
+   gene=genes$ID,
+   procyclic=meta_pro_primary_sl_reads,
+   amastigote=meta_amast_primary_sl_reads
+))
+
+amast_other_sl_sites = tbl_df(data.frame(
+   gene=genes$ID,
+   procyclic=amast_pro_primary_sl_reads,
+   metacyclic=amast_meta_primary_sl_reads
+))
 ```
 
 ##### 5'UTR Composition
@@ -505,6 +726,7 @@ amastigote_utr5_features_df = data.frame(
     ct=(freqs[,'C'] + freqs[,'T']) / rowSums(freqs)
 )
 amastigote_utr5_df = merge(amastigote_utr5_df, amastigote_utr5_features_df,
+                           by='name')
 
 # Combined
 combined_utr5_sequences = get_utr_sequences(genes, fasta, combined_utr5_df, 
@@ -540,17 +762,34 @@ close(fp)
 
 ```{r compute_3utr_lengths, message=FALSE, cache=TRUE, autodep=TRUE}
 # Output columns
-procyclic_lengths   = c()
-procyclic_num_reads = c()
+procyclic_lengths           = c()
+procyclic_num_reads         = c()
+procyclic_num_reads_primary = c()
+procyclic_num_reads_secondary = c()
 
-metacyclic_lengths   = c()
-metacyclic_num_reads = c()
+metacyclic_lengths           = c()
+metacyclic_num_reads         = c()
+metacyclic_num_reads_primary = c()
+metacyclic_num_reads_secondary = c()
 
-amastigote_lengths   = c()
-amastigote_num_reads = c()
+amastigote_lengths           = c()
+amastigote_num_reads         = c()
+amastigote_num_reads_primary = c()
+amastigote_num_reads_secondary = c()
 
-combined_lengths   = c()
-combined_num_reads = c()
+combined_lengths           = c()
+combined_num_reads         = c()
+combined_num_reads_primary = c()
+combined_num_reads_secondary = c()
+
+# Vectors to keep track of stage-specific primary site coverage across
+# different stages (e.g. amastigote primary site reads in procyclic samples)
+pro_meta_primary_polya_reads = c()
+pro_amast_primary_polya_reads = c()
+meta_pro_primary_polya_reads = c()
+meta_amast_primary_polya_reads = c()
+amast_pro_primary_polya_reads = c()
+amast_meta_primary_polya_reads = c()
 
 # Start GFF output for combined set of acceptor sites
 gff_lines = c("##gff-version\t3",
@@ -594,17 +833,17 @@ plot_num = 0
 
 # Add gene entries
 i = 1
-for (name in genes$Name) {
+for (gene_id in genes$ID) {
     message(sprintf("Processing Poly(A) sites for gene %d/%d", i, length(genes)))
-    gene = genes[genes$Name == name]
+    gene = genes[genes$ID == gene_id]
 
     gene_strand = as.character(strand(gene)) 
 
     # get all of the Poly(A) acceptor sites as a GRanges object
-    metacyclic_utr3 = metacyclic_polya[metacyclic_polya$Name == name]
-    procyclic_utr3  = procyclic_polya[procyclic_polya$Name == name]
-    amastigote_utr3 = amastigote_polya[amastigote_polya$Name == name]
-    combined_utr3   = metacyclic_polya[metacyclic_polya$Name == name]
+    metacyclic_utr3 = metacyclic_polya[metacyclic_polya$Name == gene_id]
+    procyclic_utr3  = procyclic_polya[procyclic_polya$Name == gene_id]
+    amastigote_utr3 = amastigote_polya[amastigote_polya$Name == gene_id]
+    combined_utr3   = metacyclic_polya[metacyclic_polya$Name == gene_id]
 
     # total number of reads found which contain an acceptor site
     metacyclic_num_reads = append(metacyclic_num_reads, 
@@ -615,7 +854,8 @@ for (name in genes$Name) {
                                   sum(amastigote_utr3$score))
     combined_num_reads   = append(combined_num_reads,
                                   sum(procyclic_utr3$score) +
-                                  sum(metacyclic_utr3$score))
+                                  sum(metacyclic_utr3$score) +
+                                  sum(amastigote_utr3$score))
     
     # Combined output
     if (length(procyclic_utr3) > 0) {
@@ -627,8 +867,9 @@ for (name in genes$Name) {
             }
             # otherwise add procyclic score to existing metacyclic score
             else {
-                site = combined_utr3[start(combined_utr3) == start(entry)]
-                score(site) = score(site) + score(entry)
+                score(combined_utr3[start(combined_utr3) == start(entry)]) = (
+                    score(combined_utr3[start(combined_utr3) == start(entry)]) +
+                    score(entry))
             }
         }
     }
@@ -641,8 +882,9 @@ for (name in genes$Name) {
             }
             # otherwise add amastigote score to existing metacyclic score
             else {
-                site = combined_utr3[start(combined_utr3) == start(entry)]
-                score(site) = score(site) + score(entry)
+                score(combined_utr3[start(combined_utr3) == start(entry)]) = (
+                    score(combined_utr3[start(combined_utr3) == start(entry)]) +
+                    score(entry))
             }
         }
     }
@@ -650,57 +892,97 @@ for (name in genes$Name) {
 
     # Determine length and scores for procyclic, metacyclic, and combined
     # outputs
-    pro_site      = find_primary_site(procyclic_utr3, 'polya', gene, gene_strand)
-    meta_site     = find_primary_site(metacyclic_utr3, 'polya', gene, gene_strand)
-    amast_site    = find_primary_site(amastigote_utr3, 'polya', gene, gene_strand)
-    combined_site = find_primary_site(combined_utr3, 'polya', gene, gene_strand)
+    pro_primary_site      = find_primary_site(procyclic_utr3, 'polya', gene, gene_strand)
+    meta_primary_site     = find_primary_site(metacyclic_utr3, 'polya', gene, gene_strand)
+    amast_primary_site    = find_primary_site(amastigote_utr3, 'polya', gene, gene_strand)
+    combined_primary_site = find_primary_site(combined_utr3, 'polya', gene, gene_strand)
+
+    # secondary sites
+    pro_secondary_site      = find_secondary_site(procyclic_utr3, 'polya', gene, gene_strand)
+    meta_secondary_site     = find_secondary_site(metacyclic_utr3, 'polya', gene, gene_strand)
+    amast_secondary_site    = find_secondary_site(amastigote_utr3, 'polya', gene, gene_strand)
+    combined_secondary_site = find_secondary_site(combined_utr3, 'polya', gene, gene_strand)
 
     # compute 3'utr length and coordinates
     if (gene_strand == '+') {
         # procylic + strand
-        procyclic_utr3_length = pro_site[1] - end(gene)
+        procyclic_utr3_length = pro_primary_site$location - end(gene)
 
         # metacyclic + strand
-        metacyclic_utr3_length = meta_site[1] - end(gene)
+        metacyclic_utr3_length = meta_primary_site$location - end(gene)
         
         # amastigote + strand
-        amastigote_utr3_length = amast_site[1] - end(gene)
+        amastigote_utr3_length = amast_primary_site$location - end(gene)
 
         # combined + strand
         combined_utr3_start  = end(gene) + 1
-        combined_utr3_end    = combined_site[1] - 1
-        combined_utr3_length = combined_site[1] - end(gene)
+        combined_utr3_end    = combined_primary_site$location - 1
+        combined_utr3_length = combined_primary_site$location - end(gene)
     } else {
         # procyclic - strand
-        procyclic_utr3_length = start(gene) - pro_site[1]
+        procyclic_utr3_length = start(gene) - pro_primary_site$location
 
         # metacyclic - strand
-        metacyclic_utr3_length = start(gene) - meta_site[1]
+        metacyclic_utr3_length = start(gene) - meta_primary_site$location
 
         # amastigote - strand
-        amastigote_utr3_length = start(gene) - amast_site[1]
+        amastigote_utr3_length = start(gene) - amast_primary_site$location
         
         # combined - strand
-        combined_utr3_start  = combined_site[1] + 1
+        combined_utr3_start  = combined_primary_site$location + 1
         combined_utr3_end    = start(gene) - 1
-        combined_utr3_length = start(gene) - combined_site[1]
+        combined_utr3_length = start(gene) - combined_primary_site$location
     }
 
+    # Add primary site read count and UTR length
     procyclic_lengths  = append(procyclic_lengths,  procyclic_utr3_length)
     metacyclic_lengths = append(metacyclic_lengths, metacyclic_utr3_length)
-    amastigote_lengths = append(amastigote_lengths,  amastigote_utr3_length)
+    amastigote_lengths = append(amastigote_lengths, amastigote_utr3_length)
     combined_lengths   = append(combined_lengths,   combined_utr3_length)
 
-    descr = sprintf("ID=%s_3utr;Name=%s;description=%s", gene$ID, gene$Name,
+    procyclic_num_reads_primary  = append(procyclic_num_reads_primary,
+                                          pro_primary_site$num_reads)
+    metacyclic_num_reads_primary = append(metacyclic_num_reads_primary,
+                                          meta_primary_site$num_reads)
+    amastigote_num_reads_primary = append(amastigote_num_reads_primary,
+                                          amast_primary_site$num_reads)
+    combined_num_reads_primary   = append(combined_num_reads_primary,
+                                          combined_primary_site$num_reads)
+
+    procyclic_num_reads_secondary  = append(procyclic_num_reads_secondary,
+                                          pro_secondary_site$num_reads)
+    metacyclic_num_reads_secondary = append(metacyclic_num_reads_secondary,
+                                          meta_secondary_site$num_reads)
+    amastigote_num_reads_secondary = append(amastigote_num_reads_secondary,
+                                          amast_secondary_site$num_reads)
+    combined_num_reads_secondary   = append(combined_num_reads_secondary,
+                                          combined_secondary_site$num_reads)
+
+    # Update counts for cross-stage primary sites
+    pro_meta_primary_polya_reads = append(pro_meta_primary_polya_reads,
+                                 get_num_reads(procyclic_utr5, meta_primary_site$location))
+    pro_amast_primary_polya_reads = append(pro_amast_primary_polya_reads,
+                                 get_num_reads(procyclic_utr5, amast_primary_site$location))
+    meta_pro_primary_polya_reads = append(meta_pro_primary_polya_reads,
+                                 get_num_reads(metacyclic_utr5, pro_primary_site$location))
+    meta_amast_primary_polya_reads = append(meta_amast_primary_polya_reads,
+                                 get_num_reads(metacyclic_utr5, amast_primary_site$location))
+    amast_pro_primary_polya_reads = append(amast_pro_primary_polya_reads,
+                                 get_num_reads(amastigote_utr5, pro_primary_site$location))
+    amast_meta_primary_polya_reads = append(amast_meta_primary_polya_reads,
+                                 get_num_reads(amastigote_utr5, meta_primary_site$location))
+
+    # Add GFF entry
+    descr = sprintf("ID=%s_3utr;Name=%s;description=%s", gene$ID, gene$ID,
                     gene$description)
 
     gff_entry = paste(
         seqnames(gene),
         "El-Sayed",
-        "five_prime_UTR",
+        "three_prime_UTR",
         combined_utr3_start,
         combined_utr3_end,
-        combined_site[2],
+        combined_primary_site$num_reads,
         strand(gene),
         '.',
         descr, sep='\t')
@@ -710,31 +992,58 @@ for (name in genes$Name) {
 
 # metacyclic
 metacyclic_utr3_df = data.frame(
-    name=genes$Name,
+    name=genes$ID,
     length=metacyclic_lengths,
-    num_reads=metacyclic_num_reads
+    num_reads=metacyclic_num_reads,
+    num_reads_primary=metacyclic_num_reads_primary,
+    num_reads_secondary=metacyclic_num_reads_secondary
 )
 
 # procyclic
 procyclic_utr3_df = data.frame(
-    name=genes$Name,
+    name=genes$ID,
     length=procyclic_lengths,
-    num_reads=procyclic_num_reads
+    num_reads=procyclic_num_reads,
+    num_reads_primary=procyclic_num_reads_primary,
+    num_reads_secondary=procyclic_num_reads_secondary
 )
 
 # amastigote
 amastigote_utr3_df = data.frame(
-    name=genes$Name,
+    name=genes$ID,
     length=amastigote_lengths,
-    num_reads=amastigote_num_reads
+    num_reads=amastigote_num_reads,
+    num_reads_primary=amastigote_num_reads_primary,
+    num_reads_secondary=amastigote_num_reads_secondary
 )
 
 # combined
 combined_utr3_df = data.frame(
-    name=genes$Name,
+    name=genes$ID,
     length=combined_lengths,
-    num_reads=combined_num_reads
+    num_reads=combined_num_reads,
+    num_reads_primary=combined_num_reads_primary,
+    num_reads_secondary=combined_num_reads_secondary
 )
+
+# Create cross-stage site usage dataframes
+pro_other_polya_sites = tbl_df(data.frame(
+   gene=genes$ID,
+   metacyclic=pro_meta_primary_polya_reads,
+   amastigote=pro_amast_primary_polya_reads
+))
+
+meta_other_polya_sites = tbl_df(data.frame(
+   gene=genes$ID,
+   procyclic=meta_pro_primary_polya_reads,
+   amastigote=meta_amast_primary_polya_reads
+))
+
+amast_other_polya_sites = tbl_df(data.frame(
+   gene=genes$ID,
+   procyclic=amast_pro_primary_polya_reads,
+   metacyclic=amast_meta_primary_polya_reads
+))
 ```
 
 ##### 3'UTR Composition
@@ -844,149 +1153,369 @@ hist(lengths)
 
 #### Metacyclic vs. Procyclic
 
-```{r alt_trans_splicing_meta_vs_pro, fig.width=3840/96, fig.height=2160/96}
+```{r alt_trans_splicing_meta_vs_pro}
+# rescale to range 0-1
+# if trimmed=TRUE, outliers will be trimmed first to reduce their influence on
+# the resulting colorscale
+rescale = function (x, trimmed=TRUE, trim_quantile=0.99) {
+    if (trimmed) {
+        lower_bound = quantile(x, 1 - trim_quantile)
+        upper_bound = quantile(x, trim_quantile)
+   
+        x = pmax(pmin(x, upper_bound), lower_bound)
+
+        return(pmax(0, ((x-min(x)) / (max(x) - min(x)))))
+    }
+    # no trimming
+    return(pmax(0, ((x-min(x)) / (max(x) - min(x)))))
+}
+
 # metacyclic vs. procyclic
-utr5_comparison = data.frame(name=metacyclic_utr5_df$name,
-                             metacyclic=metacyclic_utr5_df$length,
-                             procyclic=procyclic_utr5_df$length,
-                             count_difference=abs(metacyclic_utr5_df$num_reads -
-                                                  procyclic_utr5_df$num_reads))
-utr5_comparison %>% ggvis(~metacyclic, ~procyclic, fill=~count_difference) %>% 
-    layer_points() %>% 
-    add_tooltip(function(df) df$name)
+# For the purposes of comparing usage ratios, we will treat non-covered sites
+# as having one read mapped
+meta_pro_5utr_comparison = tbl_df(data.frame(
+    name=metacyclic_utr5_df$name,
+    metacyclic_len=metacyclic_utr5_df$length,
+    procyclic_len=procyclic_utr5_df$length,
+    average_primary_site_num_reads=(metacyclic_utr5_df$num_reads_primary +
+                                    procyclic_utr5_df$num_reads_primary) / 2,
+    average_ptos_ratio=((metacyclic_utr5_df$num_reads_primary /
+                         metacyclic_utr5_df$num_reads_secondary) + 
+                        (procyclic_utr5_df$num_reads_primary /
+                         procyclic_utr5_df$num_reads_secondary)) / 2,
+    count_average=(metacyclic_utr5_df$num_reads_primary +
+                   procyclic_utr5_df$num_reads_primary) / 2,
+    meta_pro_ratio_meta_samples=(metacyclic_utr5_df$num_reads_primary /
+                           pmax(meta_other_sl_sites$procyclic, 1)),
+    pro_meta_ratio_pro_samples=(procyclic_utr5_df$num_reads_primary / 
+                          pmax(pro_other_sl_sites$metacyclic, 1))
+))
 
-ggplot(utr5_comparison, aes(metacyclic, procyclic, color=count_difference)) + 
-    geom_point()
+# version with reads mapped for stages of interest
+meta_pro_5utr_comparison_complete = meta_pro_5utr_comparison %>%
+    filter(!is.na(metacyclic_len) & !is.na(procyclic_len)) %>%
+    mutate(
+        log_average_ratio=log2(0.5 * (meta_pro_ratio_meta_samples + pro_meta_ratio_pro_samples)),
+        length_diff=abs(metacyclic_len - procyclic_len), 
+        log_average_reads=log2(average_primary_site_num_reads),
+        log_average_ptos=log2(average_ptos_ratio),
+        log_length_diff=log2(length_diff)
+    )
 
-utr5_comparison_complete = utr5_comparison[complete.cases(utr5_comparison),]
-utr5_diff = utr5_comparison_complete[utr5_comparison_complete$metacyclic != 
-                                     utr5_comparison_complete$procyclic,]
-utr5_diff$length_diff = abs(utr5_diff$metacyclic - utr5_diff$procyclic)
-kable(head(utr5_diff[with(utr5_diff, order(length_diff, decreasing=TRUE)),], 50))
+ggplot(meta_pro_5utr_comparison_complete, 
+       aes(metacyclic_len, procyclic_len, color=log_average_ptos,
+           size=average_primary_site_num_reads)) + 
+    geom_point() +
+    scale_color_gradient2(low="black", mid="blue", high="red") +
+    geom_abline(slope=1, intercept=300, color='#666666', lwd=0.5) +
+    geom_abline(slope=1, intercept=-300, color='#666666', lwd=0.5) +
+    scale_x_continuous(expand = c(0.01, 0.01)) +
+    scale_y_continuous(expand = c(0.01, 0.01))
+    #geom_segment(aes(x=300, y=0, xend=6000, yend=5700, color='#666666'))
+    #scale_colour_continuous(high='red') 
+    #scale_size(trans='log')
+
+# sites with switching only
+ggplot(meta_pro_5utr_comparison_complete %>% filter(metacyclic_len != procyclic_len),
+       aes(metacyclic_len, procyclic_len, color=log_average_ptos,
+           size=log_average_reads)) + 
+    geom_point() +
+    scale_color_gradient2(low="black", mid="blue", high="red") +
+    geom_abline(slope=1, intercept=300, color='#666666', lwd=0.5) +
+    geom_abline(slope=1, intercept=-300, color='#666666', lwd=0.5) +
+    scale_x_continuous(expand = c(0.01, 0.01)) +
+    scale_y_continuous(expand = c(0.01, 0.01))
+
+# print top 25 genes with strongest site switching behavior
+meta_pro_5utr_diff = meta_pro_5utr_comparison_complete %>% 
+    filter(count_average & log_average_ratio > 0.75) %>%
+    select(-log_length_diff)
+#kable(head(meta_pro_5utr_diff  %>% arrange(-score), 25))
+
 print(sprintf("Number of alternatively trans-spliced genes (meta vs. pro): %d",
-              nrow(utr5_diff)))
+              nrow(meta_pro_5utr_diff)))
 ```
 
 #### Metacyclic vs. Amastigote
 
 ```{r alt_trans_splicing_meta_vs_amast}
-utr5_comparison = data.frame(name=metacyclic_utr5_df$name,
-                             metacyclic=metacyclic_utr5_df$length,
-                             amastigote=amastigote_utr5_df$length,
-                             count_difference=abs(metacyclic_utr5_df$num_reads -
-                                                  amastigote_utr5_df$num_reads))
-utr5_comparison %>% ggvis(~metacyclic, ~amastigote, fill=~count_difference) %>% 
-    layer_points() %>% 
-    add_tooltip(function(df) df$name)
+# metacyclic vs. amastigote
+meta_amast_5utr_comparison = tbl_df(data.frame(
+    name=metacyclic_utr5_df$name,
+    metacyclic_len=metacyclic_utr5_df$length,
+    amastigote_len=amastigote_utr5_df$length,
+    average_primary_site_num_reads=abs(metacyclic_utr5_df$num_reads_primary -
+                   amastigote_utr5_df$num_reads_primary),
+    average_ptos_ratio=((metacyclic_utr5_df$num_reads_primary /
+                         metacyclic_utr5_df$num_reads_secondary) + 
+                        (amastigote_utr5_df$num_reads_primary /
+                         amastigote_utr5_df$num_reads_secondary)) / 2,
+    meta_amast_ratio_meta_samples=(metacyclic_utr5_df$num_reads_primary /
+                           pmax(meta_other_sl_sites$amastigote, 1)),
+    amast_meta_ratio_amast_samples=(amastigote_utr5_df$num_reads_primary / 
+                          pmax(amast_other_sl_sites$metacyclic, 1))
+)) %>% mutate(
+    length_diff=abs(metacyclic_len - amastigote_len), 
+    log_average_reads=log1p(average_primary_site_num_reads),
+    log_average_ptos=log1p(average_ptos_ratio),
+    log_length_diff=log1p(length_diff)
+)
 
-ggplot(utr5_comparison, aes(metacyclic, amastigote, color=count_difference)) + 
-    geom_point()
+# version with reads mapped for stages of interest
+meta_amast_5utr_comparison_complete = meta_amast_5utr_comparison %>%
+    filter(!is.na(metacyclic_len) & !is.na(amastigote_len)) %>%
+    mutate(log_average_ratio=log1p(0.5 * (meta_amast_ratio_meta_samples +
+                                          amast_meta_ratio_amast_samples)))
 
-utr5_comparison_complete = utr5_comparison[complete.cases(utr5_comparison),]
-utr5_diff = utr5_comparison_complete[utr5_comparison_complete$metacyclic != 
-                                     utr5_comparison_complete$amastigote,]
-utr5_diff$length_diff = abs(utr5_diff$metacyclic - utr5_diff$amastigote)
-kable(head(utr5_diff[with(utr5_diff, order(length_diff, decreasing=TRUE)),], 50))
+#meta_amast_5utr_comparison_complete %>% 
+#    ggvis(~metacyclic_len, ~amastigote_len, fill=~log_average_reads) %>% 
+#    layer_points() %>% 
+#    add_tooltip(function(df) df$name)
+ggplot(meta_amast_5utr_comparison_complete, 
+       aes(metacyclic_len, amastigote_len, color=log_average_ptos,
+           size=log_average_reads)) + 
+    geom_point() +
+    scale_color_gradient2(low="black", mid="blue", high="red") + 
+    geom_abline(slope=1, intercept=300, color='#666666') +
+    geom_abline(slope=1, intercept=-300, color='#666666') +
+    scale_x_continuous(expand = c(0.01, 0.01)) +
+    scale_y_continuous(expand = c(0.01, 0.01))
+    #geom_segment(aes(x=300, y=0, xend=6000, yend=5700, color='#666666'))
+    #scale_colour_continuous(high='red') 
+
+# print top 25 genes with strongest site switching behavior
+meta_amast_5utr_diff = meta_amast_5utr_comparison_complete %>% 
+    filter(length_diff > 300 & log_average_ratio > 0.75) %>%
+    select(-log_length_diff)
+#kable(head(meta_amast_5utr_diff  %>% arrange(-score), 25))
 print(sprintf("Number of alternatively trans-spliced genes (meta vs. amast): %d",
-              nrow(utr5_diff)))
+              nrow(meta_amast_5utr_diff)))
 ```
 
 #### Procyclic vs. Amastigote
 
 ```{r alt_trans_splicing_pro_vs_amast}
-utr5_comparison = data.frame(name=procyclic_utr5_df$name,
-                             procyclic=procyclic_utr5_df$length,
-                             amastigote=amastigote_utr5_df$length,
-                             count_difference=abs(procyclic_utr5_df$num_reads -
-                                                  amastigote_utr5_df$num_reads))
-utr5_comparison %>% ggvis(~procyclic, ~amastigote, fill=~count_difference) %>% 
-    layer_points() %>% 
-    add_tooltip(function(df) df$name)
+# procyclic vs. amastigote
+pro_amast_5utr_comparison = tbl_df(data.frame(
+    name=procyclic_utr5_df$name,
+    procyclic_len=procyclic_utr5_df$length,
+    amastigote_len=amastigote_utr5_df$length,
+    average_primary_site_num_reads=abs(procyclic_utr5_df$num_reads_primary -
+                   amastigote_utr5_df$num_reads_primary),
+    average_ptos_ratio=((procyclic_utr5_df$num_reads_primary /
+                         procyclic_utr5_df$num_reads_secondary) + 
+                        (amastigote_utr5_df$num_reads_primary /
+                         amastigote_utr5_df$num_reads_secondary)) / 2,
+    pro_amast_ratio_pro_samples=(procyclic_utr5_df$num_reads_primary /
+                          pmax(pro_other_sl_sites$amastigote, 1)),
+    amast_pro_ratio_amast_samples=(amastigote_utr5_df$num_reads_primary / 
+                            pmax(amast_other_sl_sites$procyclic, 1))
+)) %>% mutate(
+    length_diff=abs(procyclic_len - amastigote_len), 
+    log_average_reads=log1p(average_primary_site_num_reads),
+    log_average_ptos=log1p(average_ptos_ratio),
+    log_length_diff=log1p(length_diff)
+)
 
-ggplot(utr5_comparison, aes(procyclic, amastigote, color=count_difference)) + 
-    geom_point()
+# version with reads mapped for stages of interest
+pro_amast_5utr_comparison_complete = pro_amast_5utr_comparison %>%
+    filter(!is.na(procyclic_len) & !is.na(amastigote_len)) %>%
+    mutate(log_average_ratio=log1p(0.5 * (pro_amast_ratio_pro_samples +
+                                          amast_pro_ratio_amast_samples)))
 
-utr5_comparison_complete = utr5_comparison[complete.cases(utr5_comparison),]
-utr5_diff = utr5_comparison_complete[utr5_comparison_complete$procyclic != 
-                                     utr5_comparison_complete$amastigote,]
-utr5_diff$length_diff = abs(utr5_diff$procyclic - utr5_diff$amastigote)
-kable(head(utr5_diff[with(utr5_diff, order(length_diff, decreasing=TRUE)),], 50))
+ggplot(pro_amast_5utr_comparison_complete, 
+       aes(procyclic_len, amastigote_len, color=log_average_ptos,
+           size=log_average_reads)) + 
+    geom_point() +
+    scale_color_gradient2(low="black", mid="blue", high="red") + 
+    geom_abline(slope=1, intercept=300, color='#666666') +
+    geom_abline(slope=1, intercept=-300, color='#666666') +
+    scale_x_continuous(expand = c(0.01, 0.01)) +
+    scale_y_continuous(expand = c(0.01, 0.01))
+    #geom_segment(aes(x=300, y=0, xend=6000, yend=5700, color='#666666'))
+    #scale_colour_continuous(high='red') 
+
+# print top 25 genes with strongest site switching behavior
+pro_amast_5utr_diff = pro_amast_5utr_comparison_complete %>% 
+    filter(length_diff > 300 & log_average_ratio > 0.75) %>%
+    select(-log_length_diff)
+#kable(head(pro_amast_5utr_diff  %>% arrange(-score), 25))
 print(sprintf("Number of alternatively trans-spliced genes (pro vs. amast): %d",
-              nrow(utr5_diff)))
+              nrow(pro_amast_5utr_diff)))
 ```
 
 ### Alternative poly-adenylation
 
 #### Metacyclic vs. Procyclic
 
-```{r alt_polya_meta_vs_pro, fig.width=3840/96, fig.height=2160/96}
-utr3_comparison = data.frame(name=metacyclic_utr3_df$name,
-                             metacyclic=metacyclic_utr3_df$length,
-                             procyclic=procyclic_utr3_df$length,
-                             count_difference=abs(metacyclic_utr3_df$num_reads -
-                                                  procyclic_utr3_df$num_reads))
-utr3_comparison %>% ggvis(~metacyclic, ~procyclic, fill=~count_difference) %>% 
-    layer_points() %>% 
-    add_tooltip(function(df) df$name)
-ggplot(utr3_comparison, aes(metacyclic, procyclic, color=count_difference)) + 
-    geom_point()
+```{r alt_polya_meta_vs_pro}
+# metacyclic vs. procyclic
+# For the purposes of comparing usage ratios, we will treat non-covered sites
+# as having one read mapped
+meta_pro_3utr_comparison = tbl_df(data.frame(
+    name=metacyclic_utr3_df$name,
+    metacyclic_len=metacyclic_utr3_df$length,
+    procyclic_len=procyclic_utr3_df$length,
+    count_average=(metacyclic_utr3_df$num_reads_primary +
+                   procyclic_utr3_df$num_reads_primary) / 2,
+    average_ptos_ratio=((metacyclic_utr3_df$num_reads_primary /
+                         metacyclic_utr3_df$num_reads_secondary) + 
+                        (procyclic_utr3_df$num_reads_primary /
+                         procyclic_utr3_df$num_reads_secondary)) / 2,
+    average_primary_site_num_reads=abs(metacyclic_utr3_df$num_reads_primary -
+                   procyclic_utr3_df$num_reads_primary),
+    meta_pro_ratio_meta_samples=(metacyclic_utr3_df$num_reads_primary /
+                           pmax(meta_other_polya_sites$procyclic, 1)),
+    pro_meta_ratio_pro_samples=(procyclic_utr3_df$num_reads_primary / 
+                          pmax(pro_other_polya_sites$metacyclic, 1))
+))
 
-utr3_comparison_complete = utr3_comparison[complete.cases(utr3_comparison),]
-utr3_diff = utr3_comparison_complete[utr3_comparison_complete$metacyclic != 
-                                     utr3_comparison_complete$procyclic,]
-utr3_diff$length_diff = abs(utr3_diff$metacyclic - utr3_diff$procyclic)
-kable(head(utr3_diff[with(utr3_diff, order(length_diff, decreasing=TRUE)),], 50))
+# version with reads mapped for stages of interest
+meta_pro_3utr_comparison_complete = meta_pro_3utr_comparison %>%
+    filter(!is.na(metacyclic_len) & !is.na(procyclic_len)) %>%
+    mutate(
+        log_average_ratio=log2(0.5 * (meta_pro_ratio_meta_samples + pro_meta_ratio_pro_samples)),
+        length_diff=abs(metacyclic_len - procyclic_len), 
+        log_average_reads=log2(average_primary_site_num_reads),
+        log_average_ptos=log2(average_ptos_ratio),
+        log_length_diff=log2(length_diff)
+    )
 
+ggplot(meta_pro_3utr_comparison_complete, 
+       aes(metacyclic_len, procyclic_len, color=log_average_ptos,
+           size=average_primary_site_num_reads)) + 
+    geom_point() +
+    scale_color_gradient2(low="black", mid="blue", high="red") +
+    geom_abline(slope=1, intercept=300, color='#666666') +
+    geom_abline(slope=1, intercept=-300, color='#666666') +
+    scale_x_continuous(expand = c(0.01, 0.01)) +
+    scale_y_continuous(expand = c(0.01, 0.01))
+    #geom_segment(aes(x=300, y=0, xend=6000, yend=5700, color='#666666'))
+    #scale_colour_continuous(high='red') 
+
+# sites with switching only
+ggplot(meta_pro_3utr_comparison_complete %>% filter(metacyclic_len != procyclic_len),
+       aes(metacyclic_len, procyclic_len, color=log_average_ptos,
+           size=log_average_reads)) + 
+    geom_point() +
+    scale_color_gradient2(low="black", mid="blue", high="red") +
+    geom_abline(slope=1, intercept=300, color='#666666') +
+    geom_abline(slope=1, intercept=-300, color='#666666') +
+    scale_x_continuous(expand = c(0.01, 0.01)) +
+    scale_y_continuous(expand = c(0.01, 0.01))
+
+# print top 25 genes with strongest site switching behavior
+meta_pro_3utr_diff = meta_pro_3utr_comparison_complete %>% 
+    filter(length_diff > 300 & log_average_ratio > 0.75) %>%
+    select(-log_length_diff)
+#kable(head(meta_pro_3utr_diff  %>% arrange(-score), 25))
 print(sprintf("Number of alternatively trans-spliced genes (meta vs. pro): %d",
-              nrow(utr3_diff)))
+              nrow(meta_pro_3utr_diff)))
 ```
 
 #### Metacyclic vs. Amastigote
 
-```{r alt_polya_meta_vs_amast, fig.width=3840/96, fig.height=2160/96}
-utr3_comparison = data.frame(name=metacyclic_utr3_df$name,
-                             metacyclic=metacyclic_utr3_df$length,
-                             amastigote=amastigote_utr3_df$length,
-                             count_difference=abs(metacyclic_utr3_df$num_reads -
-                                                  amastigote_utr3_df$num_reads))
-utr3_comparison %>% ggvis(~metacyclic, ~amastigote, fill=~count_difference) %>% 
-    layer_points() %>% 
-    add_tooltip(function(df) df$name)
-ggplot(utr3_comparison, aes(metacyclic, amastigote, color=count_difference)) + 
-    geom_point()
+```{r alt_polya_meta_vs_amast}
+# metacyclic vs. amastigote
+meta_amast_3utr_comparison = tbl_df(data.frame(
+    name=metacyclic_utr3_df$name,
+    metacyclic_len=metacyclic_utr3_df$length,
+    amastigote_len=amastigote_utr3_df$length,
+    average_primary_site_num_reads=abs(metacyclic_utr3_df$num_reads_primary -
+                   amastigote_utr3_df$num_reads_primary),
+    average_ptos_ratio=((metacyclic_utr3_df$num_reads_primary /
+                         metacyclic_utr3_df$num_reads_secondary) + 
+                        (amastigote_utr3_df$num_reads_primary /
+                         amastigote_utr3_df$num_reads_secondary)) / 2,
+    meta_amast_ratio_meta_samples=(metacyclic_utr3_df$num_reads_primary /
+                           pmax(meta_other_polya_sites$amastigote, 1)),
+    amast_meta_ratio_amast_samples=(amastigote_utr3_df$num_reads_primary / 
+                            pmax(amast_other_polya_sites$metacyclic, 1))
+)) %>% mutate(
+    length_diff=abs(metacyclic_len - amastigote_len), 
+    log_average_reads=log1p(average_primary_site_num_reads),
+    log_average_ptos=log1p(average_ptos_ratio),
+    log_length_diff=log1p(length_diff)
+)
 
-utr3_comparison_complete = utr3_comparison[complete.cases(utr3_comparison),]
-utr3_diff = utr3_comparison_complete[utr3_comparison_complete$metacyclic != 
-                                     utr3_comparison_complete$amastigote,]
-utr3_diff$length_diff = abs(utr3_diff$metacyclic - utr3_diff$amastigote)
-kable(head(utr3_diff[with(utr3_diff, order(length_diff, decreasing=TRUE)),], 50))
+# version with reads mapped for stages of interest
+meta_amast_3utr_comparison_complete = meta_amast_3utr_comparison %>%
+    filter(!is.na(metacyclic_len) & !is.na(amastigote_len)) %>%
+    mutate(log_average_ratio=log1p(0.5 * (meta_amast_ratio_meta_samples +
+                                   amast_meta_ratio_amast_samples)))
 
+ggplot(meta_amast_3utr_comparison_complete, 
+       aes(metacyclic_len, amastigote_len, color=log_average_ptos,
+           size=log_average_reads)) + 
+    geom_point() +
+    scale_color_gradient2(low="black", mid="blue", high="red") +
+    geom_abline(slope=1, intercept=300, color='#666666') +
+    geom_abline(slope=1, intercept=-300, color='#666666') +
+    scale_x_continuous(expand = c(0.01, 0.01)) +
+    scale_y_continuous(expand = c(0.01, 0.01))
+    #geom_segment(aes(x=300, y=0, xend=6000, yend=5700, color='#666666'))
+    #scale_colour_continuous(high='red') 
+
+# print top 25 genes with strongest site switching behavior
+meta_amast_3utr_diff = meta_amast_3utr_comparison_complete %>% 
+    filter(length_diff > 300 & log_average_ratio > 0.75) %>%
+    select(-log_length_diff)
+#kable(head(meta_amast_3utr_diff  %>% arrange(-score), 25))
 print(sprintf("Number of alternatively trans-spliced genes (meta vs. amast): %d",
-              nrow(utr3_diff)))
+              nrow(meta_amast_3utr_diff)))
 ```
 
 #### Procyclic vs. Amastigote
 
-```{r alt_polya_pro_vs_amast, fig.width=3840/96, fig.height=2160/96}
-utr3_comparison = data.frame(name=procyclic_utr3_df$name,
-                             procyclic=procyclic_utr3_df$length,
-                             amastigote=amastigote_utr3_df$length,
-                             count_difference=abs(procyclic_utr3_df$num_reads -
-                                                  amastigote_utr3_df$num_reads))
-utr3_comparison %>% ggvis(~procyclic, ~amastigote, fill=~count_difference) %>% 
-    layer_points() %>% 
-    add_tooltip(function(df) df$name)
-ggplot(utr3_comparison, aes(procyclic, amastigote, color=count_difference)) + 
-    geom_point()
+```{r alt_polya_pro_vs_amast}
+# procyclic vs. amastigote
+pro_amast_3utr_comparison = tbl_df(data.frame(
+    name=procyclic_utr3_df$name,
+    procyclic_len=procyclic_utr3_df$length,
+    amastigote_len=amastigote_utr3_df$length,
+    average_primary_site_num_reads=abs(procyclic_utr3_df$num_reads_primary -
+                   amastigote_utr3_df$num_reads_primary),
+    average_ptos_ratio=((procyclic_utr3_df$num_reads_primary /
+                         procyclic_utr3_df$num_reads_secondary) + 
+                        (amastigote_utr3_df$num_reads_primary /
+                         amastigote_utr3_df$num_reads_secondary)) / 2,
+    pro_amast_ratio_pro_samples=(procyclic_utr3_df$num_reads_primary /
+                           pmax(pro_other_polya_sites$amastigote, 1)),
+    amast_pro_ratio_amast_samples=(amastigote_utr3_df$num_reads_primary / 
+                          pmax(amast_other_polya_sites$procyclic, 1))
+)) %>% mutate(
+    length_diff=abs(procyclic_len - amastigote_len), 
+    log_average_reads=log1p(average_primary_site_num_reads),
+    log_average_ptos=log1p(average_ptos_ratio),
+    log_length_diff=log1p(length_diff)
+)
 
-utr3_comparison_complete = utr3_comparison[complete.cases(utr3_comparison),]
-utr3_diff = utr3_comparison_complete[utr3_comparison_complete$procyclic != 
-                                     utr3_comparison_complete$amastigote,]
-utr3_diff$length_diff = abs(utr3_diff$procyclic - utr3_diff$amastigote)
-kable(head(utr3_diff[with(utr3_diff, order(length_diff, decreasing=TRUE)),], 50))
+# version with reads mapped for stages of interest
+pro_amast_3utr_comparison_complete = pro_amast_3utr_comparison %>%
+    filter(!is.na(procyclic_len) & !is.na(amastigote_len)) %>%
+    mutate(log_average_ratio=log1p(0.5 * (pro_amast_ratio_pro_samples +
+                                amast_pro_ratio_amast_samples)))
 
+ggplot(pro_amast_3utr_comparison_complete, 
+       aes(procyclic_len, amastigote_len, color=log_average_ptos,
+           size=log_average_reads)) + 
+    geom_point() +
+    scale_color_gradient2(low="black", mid="blue", high="red") +
+    geom_abline(slope=1, intercept=300, color='#666666') +
+    geom_abline(slope=1, intercept=-300, color='#666666') +
+    scale_x_continuous(expand = c(0.01, 0.01)) +
+    scale_y_continuous(expand = c(0.01, 0.01))
+    #geom_segment(aes(x=300, y=0, xend=6000, yend=5700, color='#666666'))
+    #scale_color_gradient2(low="black", mid="blue", high="red", trans='log')
+    #scale_colour_continuous(high='red') 
+
+# print top 25 genes with strongest site switching behavior
+pro_amast_3utr_diff = pro_amast_3utr_comparison_complete %>% 
+    filter(length_diff > 300 & log_average_ratio > 0.75) %>%
+    select(-log_length_diff)
+#kable(head(pro_amast_3utr_diff  %>% arrange(-score), 25))
 print(sprintf("Number of alternatively trans-spliced genes (pro vs. amast): %d",
-              nrow(utr3_diff)))
+              nrow(pro_amast_3utr_diff)))
 ```
 
 System Information
