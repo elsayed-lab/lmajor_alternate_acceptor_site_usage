@@ -3,6 +3,7 @@ title: "L. major UTR Analysis"
 output:
   knitrBootstrap::bootstrap_document:
     theme: flatly
+    clean_supporting: false
 ---
 
 ```{r knitr_settings, include=FALSE}
